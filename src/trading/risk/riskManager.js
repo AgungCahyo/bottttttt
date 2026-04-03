@@ -1,0 +1,174 @@
+'use strict';
+const fs   = require('fs');
+const path = require('path');
+
+const RISK_FILE = path.join(__dirname, '../../../trading_risk.json');
+
+// ============================================================
+// DEFAULT RISK CONFIG
+// Edit via /trading_config command atau langsung di .env
+// ============================================================
+const DEFAULT_RISK = {
+    // Per-trade
+    maxLossPerTradePct:  50,     // SL -50% (meme coin sangat volatile)
+    maxBuyAmountSol:     0.5,
+    minBuyAmountSol:     0.01,
+
+    // Harian
+    dailyLossLimitSol:   2.0,
+    maxTradesPerDay:     20,
+
+    // Token
+    whitelistEnabled:    false,
+    whitelist:           [],
+
+    // Slippage
+    defaultSlippageBps:  1500,   // 15% (pump.fun butuh slippage tinggi)
+    maxSlippageBps:      3000,   // 30% max
+
+    // Price Impact
+    maxPriceImpactPct:   15.0,   // Naikkan dari 3% → 15% untuk meme coin
+};
+
+// ============================================================
+// DAILY STATS (reset tiap hari)
+// ============================================================
+let dailyStats = {
+    date:        today(),
+    totalLossSol: 0,
+    totalProfitSol: 0,
+    tradeCount:  0,
+    blockedCount: 0,
+};
+
+function today() {
+    return new Date().toISOString().slice(0, 10); // YYYY-MM-DD
+}
+
+function checkDayReset() {
+    if (dailyStats.date !== today()) {
+        dailyStats = { date: today(), totalLossSol: 0, totalProfitSol: 0, tradeCount: 0, blockedCount: 0 };
+        console.log('📅 Daily stats direset untuk hari baru.');
+    }
+}
+
+// ============================================================
+// LOAD / SAVE RISK CONFIG
+// ============================================================
+let riskConfig = { ...DEFAULT_RISK };
+
+function loadRiskConfig() {
+    try {
+        if (fs.existsSync(RISK_FILE)) {
+            const saved = JSON.parse(fs.readFileSync(RISK_FILE, 'utf8'));
+            riskConfig = { ...DEFAULT_RISK, ...saved };
+            console.log('🛡️  Risk config dimuat dari file.');
+        }
+    } catch (err) {
+        console.warn('⚠️ Gagal load risk config:', err.message);
+    }
+}
+
+function saveRiskConfig() {
+    try {
+        fs.writeFileSync(RISK_FILE, JSON.stringify(riskConfig, null, 2), 'utf8');
+    } catch (err) {
+        console.warn('⚠️ Gagal simpan risk config:', err.message);
+    }
+}
+
+function getRiskConfig() { return { ...riskConfig }; }
+
+function updateRiskConfig(updates) {
+    riskConfig = { ...riskConfig, ...updates };
+    saveRiskConfig();
+}
+
+// ============================================================
+// VALIDASI SEBELUM BUY
+// Returns: { allowed: bool, reason: string }
+// ============================================================
+function validateBuy({ mint, amountSol, priceImpactPct = 0 }) {
+    checkDayReset();
+
+    // 1. Jumlah minimum & maksimum
+    if (amountSol < riskConfig.minBuyAmountSol)
+        return { allowed: false, reason: `Jumlah terlalu kecil (min ${riskConfig.minBuyAmountSol} SOL)` };
+
+    if (amountSol > riskConfig.maxBuyAmountSol)
+        return { allowed: false, reason: `Jumlah melebihi batas (max ${riskConfig.maxBuyAmountSol} SOL)` };
+
+    // 2. Daily loss limit
+    if (dailyStats.totalLossSol >= riskConfig.dailyLossLimitSol)
+        return { allowed: false, reason: `Daily loss limit tercapai (${dailyStats.totalLossSol.toFixed(3)} SOL)` };
+
+    // 3. Max trades per day
+    if (dailyStats.tradeCount >= riskConfig.maxTradesPerDay)
+        return { allowed: false, reason: `Batas trade harian tercapai (${riskConfig.maxTradesPerDay}x)` };
+
+    // 4. Whitelist
+    if (riskConfig.whitelistEnabled && !riskConfig.whitelist.includes(mint))
+        return { allowed: false, reason: `Token tidak ada di whitelist` };
+
+    // 5. Price impact
+    if (priceImpactPct > riskConfig.maxPriceImpactPct)
+        return { allowed: false, reason: `Price impact terlalu besar (${priceImpactPct.toFixed(2)}% > ${riskConfig.maxPriceImpactPct}%)` };
+
+    return { allowed: true, reason: 'OK' };
+}
+
+// ============================================================
+// HITUNG STOP LOSS PRICE
+// ============================================================
+function calcStopLossPrice(entryPriceSol) {
+    const lossPct = riskConfig.maxLossPerTradePct / 100;
+    return entryPriceSol * (1 - lossPct);
+}
+
+// ============================================================
+// UPDATE STATS SETELAH TRADE
+// ============================================================
+function recordTrade({ pnlSol }) {
+    checkDayReset();
+    dailyStats.tradeCount++;
+    if (pnlSol < 0) dailyStats.totalLossSol  += Math.abs(pnlSol);
+    else             dailyStats.totalProfitSol += pnlSol;
+}
+
+function recordBlocked() {
+    checkDayReset();
+    dailyStats.blockedCount++;
+}
+
+function getDailyStats() {
+    checkDayReset();
+    return { ...dailyStats };
+}
+
+// ============================================================
+// WHITELIST HELPERS
+// ============================================================
+function addToWhitelist(mint) {
+    if (!riskConfig.whitelist.includes(mint)) {
+        riskConfig.whitelist.push(mint);
+        saveRiskConfig();
+    }
+}
+
+function removeFromWhitelist(mint) {
+    riskConfig.whitelist = riskConfig.whitelist.filter(m => m !== mint);
+    saveRiskConfig();
+}
+
+module.exports = {
+    loadRiskConfig,
+    getRiskConfig,
+    updateRiskConfig,
+    validateBuy,
+    calcStopLossPrice,
+    recordTrade,
+    recordBlocked,
+    getDailyStats,
+    addToWhitelist,
+    removeFromWhitelist,
+};
