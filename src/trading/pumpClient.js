@@ -2,8 +2,8 @@
 const { Connection, Keypair, PublicKey, LAMPORTS_PER_SOL } = require('@solana/web3.js');
 const { PumpFunSDK } = require('pumpdotfun-sdk');
 const { AnchorProvider } = require('@coral-xyz/anchor');
-const { default: axios } = require('axios');
-const bs58 = require('bs58').default || require('bs58');
+const axios = require('axios');
+const bs58  = require('bs58').default || require('bs58');
 
 const SOL_MINT = 'So11111111111111111111111111111111111111112';
 
@@ -15,22 +15,23 @@ let sdk        = null;
 // INIT
 // ============================================================
 function init(rpcUrl, privateKeyBase58) {
-    connection = new Connection(rpcUrl, 'confirmed');
+    if (!rpcUrl)            throw new Error('SOLANA_RPC_URL tidak diset di .env');
+    if (!privateKeyBase58)  throw new Error('WALLET_PRIVATE_KEY tidak diset di .env');
+
+    connection = new Connection(rpcUrl, {
+        commitment: 'confirmed',
+        confirmTransactionInitialTimeout: 60_000,
+    });
+
     const secretKey = bs58.decode(privateKeyBase58);
+    if (secretKey.length === 64)       wallet = Keypair.fromSecretKey(secretKey);
+    else if (secretKey.length === 32)  wallet = Keypair.fromSeed(secretKey);
+    else throw new Error(`Private key salah ukuran: ${secretKey.length} bytes`);
 
-    if (secretKey.length === 64) {
-        wallet = Keypair.fromSecretKey(secretKey);
-    } else if (secretKey.length === 32) {
-        wallet = Keypair.fromSeed(secretKey);
-    } else {
-        throw new Error(`Kunci privat salah ukuran (${secretKey.length} bytes).`);
-    }
-
-    // AnchorProvider dibutuhkan oleh pumpdotfun-sdk
     const provider = new AnchorProvider(
         connection,
         {
-            publicKey:  wallet.publicKey,
+            publicKey: wallet.publicKey,
             signTransaction:     tx  => { tx.sign([wallet]); return Promise.resolve(tx); },
             signAllTransactions: txs => { txs.forEach(tx => tx.sign([wallet])); return Promise.resolve(txs); },
         },
@@ -38,163 +39,174 @@ function init(rpcUrl, privateKeyBase58) {
     );
 
     sdk = new PumpFunSDK(provider);
-
-    console.log(`🔑 Wallet dimuat: ${wallet.publicKey.toBase58()}`);
+    console.log(`🔑 Wallet: ${wallet.publicKey.toBase58()}`);
     return wallet.publicKey.toBase58();
 }
 
-function getWalletAddress() {
-    return wallet?.publicKey?.toBase58() || null;
+function getWalletAddress() { return wallet?.publicKey?.toBase58() || null; }
+
+// ============================================================
+// SOL BALANCE
+// ============================================================
+async function getSolBalance() {
+    if (!connection || !wallet) throw new Error('pumpClient belum init');
+    const lamports = await connection.getBalance(wallet.publicKey);
+    return lamports / LAMPORTS_PER_SOL;
 }
 
 // ============================================================
-// GET TOKEN PRICE IN SOL (via bonding curve)
+// TOKEN BALANCE
+// ============================================================
+async function getBalance(mintAddress) {
+    if (!connection || !wallet) throw new Error('pumpClient belum init');
+
+    if (mintAddress === SOL_MINT) return getSolBalance();
+
+    try {
+        const tokenAccounts = await connection.getParsedTokenAccountsByOwner(
+            wallet.publicKey,
+            { mint: new PublicKey(mintAddress) }
+        );
+        if (tokenAccounts.value.length === 0) return 0;
+        return tokenAccounts.value[0].account.data.parsed.info.tokenAmount.uiAmount || 0;
+    } catch {
+        return 0;
+    }
+}
+
+// ============================================================
+// GET TOKEN PRICE IN SOL
+// Priority: bonding curve → DexScreener fallback
 // ============================================================
 async function getTokenPriceInSol(mintAddress) {
+    if (!sdk) return null;
     try {
         const mint         = new PublicKey(mintAddress);
         const bondingCurve = await sdk.getBondingCurveAccount(mint);
-        
-        if (bondingCurve) {
-            // Masih di bonding curve
-            const price = bondingCurve.getSolCostToBuyTokens(BigInt(1e6));
-            return Number(price) / LAMPORTS_PER_SOL;
-        }
 
-        // Sudah graduate → fallback DexScreener
+        if (bondingCurve) {
+            // Hitung harga 1 token (1e6 = 1 token dengan 6 desimal)
+            const costLamports = bondingCurve.getSolCostToBuyTokens(BigInt(1_000_000));
+            return Number(costLamports) / LAMPORTS_PER_SOL;
+        }
+        // Token sudah graduate → DexScreener
         return await getTokenPriceInSolFallback(mintAddress);
     } catch {
         return null;
     }
 }
 
-// ============================================================
-// GET SOL BALANCE
-// ============================================================
-async function getBalance(mintAddress) {
-    if (!connection || !wallet) throw new Error('pumpClient belum diinisialisasi.');
-
-    if (mintAddress === SOL_MINT) {
-        const lamports = await connection.getBalance(wallet.publicKey);
-        return lamports / LAMPORTS_PER_SOL;
-    }
-
-    const { getAssociatedTokenAddress }  = require('@solana/spl-token');
-    const { TOKEN_PROGRAM_ID }           = require('@solana/spl-token');
-
-    const tokenAccounts = await connection.getParsedTokenAccountsByOwner(
-        wallet.publicKey,
-        { mint: new PublicKey(mintAddress) }
-    );
-
-    if (tokenAccounts.value.length === 0) return 0;
-    return tokenAccounts.value[0].account.data.parsed.info.tokenAmount.uiAmount || 0;
-}
-
-// ============================================================
-// GET TOKEN PRICE via DexScreener (fallback untuk token graduate)
-// ============================================================
 async function getTokenPriceInSolFallback(mintAddress) {
     try {
-        await new Promise(r => setTimeout(r, 500)); // delay 500ms antar request
-        const { data } = await axios.get(`https://api.dexscreener.com/latest/dex/tokens/${mintAddress}`, {
-            timeout: 5_000,
-        });
+        const { data } = await axios.get(
+            `https://api.dexscreener.com/latest/dex/tokens/${mintAddress}`,
+            { timeout: 6_000 }
+        );
         const pair = data?.pairs?.[0];
-        if (!pair) return null;
+        if (!pair?.priceUsd) return null;
 
-        const priceUsd = parseFloat(pair.priceUsd);
-        const solPrice = require('../config/state').currentSolPrice;
-        if (!priceUsd || !solPrice) return null;
-
-        return priceUsd / solPrice;
+        const { currentSolPrice } = require('../config/state');
+        if (!currentSolPrice) return null;
+        return parseFloat(pair.priceUsd) / currentSolPrice;
     } catch {
         return null;
     }
 }
 
 // ============================================================
-// BUY TOKEN (Bonding Curve)
+// BUY via Pump.fun Bonding Curve
 // ============================================================
 async function executeSwap({ outputMint, amountLamports, slippageBps = 1500, isSimulation = false }) {
-    if (!sdk || !wallet) throw new Error('pumpClient belum diinisialisasi.');
+    if (!sdk || !wallet) throw new Error('pumpClient belum init');
 
     const mint = new PublicKey(outputMint);
-    let bondingCurve = null;
 
+    // Validasi bonding curve
+    let bondingCurve;
     try {
         bondingCurve = await sdk.getBondingCurveAccount(mint);
     } catch (err) {
-        if (err.message.includes('401')) {
-            throw new Error('RPC_AUTH_FAILED: Provider RPC (Helius) memberikan error 401 Unauthorized. Cek API Key di .env!');
+        if (err.message?.includes('401')) {
+            throw new Error('RPC_AUTH_FAILED: API Key Helius tidak valid atau expired');
         }
         throw err;
     }
 
     if (!bondingCurve) {
-        // Lempar error khusus — ditangkap di tradingEngine untuk di-skip
         const err = new Error(`GRADUATED:${outputMint}`);
         err.graduated = true;
         throw err;
     }
 
-    // Hitung estimasi token yang didapat
+    // Estimasi token output
     const tokenAmount = bondingCurve.getBuyPrice(BigInt(amountLamports));
+    const outputTokens = Number(tokenAmount) / 1e6;
 
-    // Mode simulasi — tidak kirim transaksi nyata
     if (isSimulation) {
         return {
-            txid:         `sim_pump_${Math.random().toString(36).substring(2, 15)}`,
+            txid:         `sim_${Date.now().toString(36)}`,
             inputAmount:  amountLamports / LAMPORTS_PER_SOL,
-            outputAmount: Number(tokenAmount) / 1e6,
+            outputAmount: outputTokens,
             isSimulation: true,
         };
     }
 
-    // Eksekusi buy lewat bonding curve
+    // === REAL TRADE ===
+    // Cek saldo SOL dulu
+    const solBalance = await getSolBalance();
+    const neededSol  = (amountLamports / LAMPORTS_PER_SOL) + 0.01; // 0.01 untuk fee
+    if (solBalance < neededSol) {
+        throw new Error(`Saldo SOL tidak cukup: punya ${solBalance.toFixed(4)}, butuh ${neededSol.toFixed(4)}`);
+    }
+
     const result = await sdk.buy(
         wallet,
         mint,
         BigInt(amountLamports),
         BigInt(slippageBps),
-        { unitLimit: 250_000, unitPrice: 250_000 }
+        { unitLimit: 300_000, unitPrice: 300_000 }
     );
 
-    if (!result.success) throw new Error(`Pump.fun buy gagal: ${result.error || 'unknown error'}`);
+    if (!result.success) throw new Error(`Buy gagal: ${result.error || 'unknown'}`);
 
     return {
         txid:         result.signature,
         inputAmount:  amountLamports / LAMPORTS_PER_SOL,
-        outputAmount: Number(tokenAmount) / 1e6,
+        outputAmount: outputTokens,
         isSimulation: false,
     };
 }
 
 // ============================================================
-// SELL TOKEN (Bonding Curve)
+// SELL via Pump.fun Bonding Curve
 // ============================================================
 async function executeSell({ inputMint, amountTokens, slippageBps = 1500, isSimulation = false }) {
-    if (!sdk || !wallet) throw new Error('pumpClient belum diinisialisasi.');
-
-    const mint = new PublicKey(inputMint);
+    if (!sdk || !wallet) throw new Error('pumpClient belum init');
 
     if (isSimulation) {
         return {
-            txid:         `sim_sell_${Math.random().toString(36).substring(2, 15)}`,
+            txid:         `sim_sell_${Date.now().toString(36)}`,
             outputAmount: 0,
             isSimulation: true,
         };
     }
 
+    // Validasi balance sebelum sell
+    const balance = await getBalance(inputMint);
+    if (balance <= 0) throw new Error('Saldo token 0, tidak bisa sell');
+
+    const actualSell = Math.min(amountTokens, balance);
+    const mint       = new PublicKey(inputMint);
+
     const result = await sdk.sell(
         wallet,
         mint,
-        BigInt(Math.floor(amountTokens * 1e6)),
+        BigInt(Math.floor(actualSell * 1e6)),
         BigInt(slippageBps),
-        { unitLimit: 250_000, unitPrice: 250_000 }
+        { unitLimit: 300_000, unitPrice: 300_000 }
     );
 
-    if (!result.success) throw new Error(`Pump.fun sell gagal: ${result.error || 'unknown error'}`);
+    if (!result.success) throw new Error(`Sell gagal: ${result.error || 'unknown'}`);
 
     return {
         txid:         result.signature,
@@ -206,8 +218,9 @@ async function executeSell({ inputMint, amountTokens, slippageBps = 1500, isSimu
 module.exports = {
     init,
     getWalletAddress,
-    getTokenPriceInSol,
+    getSolBalance,
     getBalance,
+    getTokenPriceInSol,
     executeSwap,
     executeSell,
     SOL_MINT,

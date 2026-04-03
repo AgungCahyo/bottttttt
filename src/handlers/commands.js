@@ -60,7 +60,9 @@ function registerHandlers(bot) {
         '/start   — Sambutan\n' +
         '/help    — Bantuan ini\n' +
         '/test    — Test kirim ke channel\n' +
-        '/status  — Status bot' +
+        '/status  — Status bot\n' +
+        '/wallet  — Info wallet & saldo SOL\n' +
+        '/trading_status — Status trading aktif' +
         (isAdmin(ctx) ? '\n\n<b>🔑 Admin:</b>\n/pause /resume /forcenews /broadcast &lt;pesan&gt;' : ''),
         { parse_mode: 'HTML' }
     ));
@@ -112,13 +114,15 @@ function registerHandlers(bot) {
         }
     });
 
-    // ─── Fallback ─────────────────────────────────────────────
+    console.log('✅ Main command handlers terdaftar.');
+}
+
+function registerFallbackHandler(bot) {
     bot.on('text', ctx => {
         if (ctx.message.text.startsWith('/'))
             return ctx.reply('❓ Perintah tidak dikenal. Ketik /help.');
     });
-
-    console.log('✅ Command handlers terdaftar.');
+    console.log('✅ Fallback handler terdaftar.');
 }
 
-module.exports = { registerHandlers, isAdmin };
+module.exports = { registerHandlers, registerFallbackHandler, isAdmin, requireAdmin };
