@@ -12,13 +12,15 @@
   "type": "commonjs",
   "dependencies": {
     "@coral-xyz/anchor": "^0.32.1",
+    "@pump-fun/pump-sdk": "^1.32.0",
+    "@solana/spl-token": "^0.4.14",
     "@solana/web3.js": "^1.98.4",
     "axios": "^1.14.0",
     "bs58": "^6.0.0",
     "dotenv": "^17.4.0",
     "express": "^5.2.1",
     "pumpdotfun-sdk": "^1.4.2",
-    "telegraf": "^4.16.3",
+    "telegraf": "^4.16.3", 
     "ws": "^8.20.0"
   }
 }

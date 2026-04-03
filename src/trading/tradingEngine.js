@@ -198,62 +198,68 @@ async function handleTrailAction(pos, action, currentPriceSol) {
 
         console.log(`${emoji} ${action.phase}: ${pos.symbol} @${action.multiplier}x | -${(action.sellPct*100).toFixed(0)}%`);
 
-    } catch (err) {
-        console.error(`❌ Trail action gagal [${pos.symbol}]:`, err.message);
-        // Notif admin jika gagal (bisa berarti token sudah mati)
-        if (!err.message?.includes('GRADUATED') && !err.message?.includes('0')) {
-            await sendToChannel(
-                `⚠️ <b>TRAIL ACTION GAGAL</b>\n` +
-                `🪙 ${esc(pos.symbol)}\n` +
-                `❗ ${esc(err.message)}\n` +
-                `<i>Cek posisi manual dengan /trading_status</i>`
-            );
-        }
+    } catch (rawError) {
+    // 🛡️ SAFE ERROR HANDLING
+    let errorMsg = 'Trail action failed';
+    if (rawError && typeof rawError === 'object') {
+        errorMsg = rawError.message || rawError.toString?.() || errorMsg;
+    } else {
+        errorMsg = rawError?.toString?.() || errorMsg;
     }
+    
+    console.error(`❌ Trail action gagal [${pos.symbol}]: ${errorMsg}`);
+    
+    // Notif hanya jika bukan error biasa
+    if (!errorMsg.includes('GRADUATED') && !errorMsg.includes('0')) {
+        await sendToChannel(
+            `⚠️ <b>TRAIL FAILED</b>\n🪙 ${esc(pos.symbol)}\n❗ ${errorMsg.slice(0, 100)}`
+        ).catch(() => {});
+    }
+}
 }
 
 // ============================================================
-// AUTO BUY — dipanggil dari pumpRadar
+// AUTO BUY — BULLETPROOF VERSION
 // ============================================================
 async function executeAutoBuy(mint, symbol, token, scoreResult) {
     const CONFIG = require('../config');
 
-    // Guard: jangan beli ulang
+    // 🔒 Guard: jangan beli ulang
     if (buyLockSet.has(mint)) return null;
     if (posTracker.hasPosition(mint)) return null;
 
-    // Guard: batas maksimum posisi terbuka
+    // 🔒 Guard: batas maksimum posisi
     if (posTracker.getPositionCount() >= MAX_POSITIONS) {
         console.warn(`⛔ Max posisi (${MAX_POSITIONS}) tercapai, skip ${symbol}`);
         return null;
     }
 
     buyLockSet.add(mint);
-    setTimeout(() => buyLockSet.delete(mint), 60_000); // cooldown 1 menit
+    setTimeout(() => buyLockSet.delete(mint), 60_000);
 
     const amountSol = CONFIG.AUTO_BUY_AMOUNT_SOL;
-    const risk      = riskManager.getRiskConfig();
+    const risk = riskManager.getRiskConfig();
 
-    // Validasi risk
+    // ✅ Risk validation
     const validation = riskManager.validateBuy({ mint, amountSol });
     if (!validation.allowed) {
-        console.warn(`⛔ Auto-buy dibatalkan [${symbol}]: ${validation.reason}`);
+        console.warn(`⛔ Risk rejected [${symbol}]: ${validation.reason}`);
         buyLockSet.delete(mint);
         return null;
     }
 
-    // Cek saldo SOL jika mode real
+    // 💰 Real mode: cek saldo SOL
     if (!CONFIG.ENABLE_SIMULATION_MODE) {
         try {
             const solBal = await pump.getSolBalance();
-            const needed = amountSol + 0.02; // buffer fee
+            const needed = amountSol + 0.02;
             if (solBal < needed) {
-                console.warn(`⛔ Saldo SOL tidak cukup: ${solBal.toFixed(4)} < ${needed.toFixed(4)}`);
+                console.warn(`⛔ Low SOL balance: ${solBal.toFixed(4)} < ${needed.toFixed(4)}`);
                 buyLockSet.delete(mint);
                 return null;
             }
-        } catch (err) {
-            console.error('❌ Gagal cek saldo SOL:', err.message);
+        } catch (e) {
+            console.error('❌ SOL balance check failed:', e?.message || 'unknown');
             buyLockSet.delete(mint);
             return null;
         }
@@ -262,17 +268,25 @@ async function executeAutoBuy(mint, symbol, token, scoreResult) {
     const modeTag = CONFIG.ENABLE_SIMULATION_MODE ? '[SIM]' : '[REAL]';
     console.log(`🤖 ${modeTag} AUTO-BUY: ${symbol} | score=${scoreResult.score} | ${amountSol} SOL`);
 
+    let result;
     try {
-        const result = await pump.executeSwap({
-            outputMint:     mint,
+        result = await pump.executeSwap({
+            outputMint: mint,
             amountLamports: Math.floor(amountSol * 1e9),
-            slippageBps:    CONFIG.AUTO_BUY_SLIPPAGE_BPS,
-            isSimulation:   CONFIG.ENABLE_SIMULATION_MODE,
+            slippageBps: CONFIG.AUTO_BUY_SLIPPAGE_BPS,
+            isSimulation: CONFIG.ENABLE_SIMULATION_MODE,
         });
 
-        if (!result || result.outputAmount <= 0) throw new Error('Output 0 token — trade rejected');
+        // VALIDASI RESULT
+        if (!result || typeof result !== 'object') {
+            throw new Error('Invalid swap result');
+        }
+        if (!result.txid || result.outputAmount <= 0) {
+            throw new Error(`Zero output: ${result.outputAmount || 0} tokens`);
+        }
 
-        const entryPriceSol    = amountSol / result.outputAmount;
+        // 📊 Open position
+        const entryPriceSol = amountSol / result.outputAmount;
         const stopLossPriceSol = entryPriceSol * (1 - risk.maxLossPerTradePct / 100);
 
         posTracker.openPosition({
@@ -280,43 +294,75 @@ async function executeAutoBuy(mint, symbol, token, scoreResult) {
             symbol,
             entryPriceSol,
             stopLossPriceSol,
-            takeProfitPriceSol: null,   // diganti trailing
-            amountToken:        result.outputAmount,
+            takeProfitPriceSol: null,
+            amountToken: result.outputAmount,
             amountSol,
-            strategy:           'AUTO',
-            txid:               result.txid,
-            isSimulation:       !!result.isSimulation,
-            scoreAtEntry:       scoreResult.score,
+            strategy: 'AUTO',
+            txid: result.txid,
+            isSimulation: !!result.isSimulation,
+            scoreAtEntry: scoreResult.score,
         });
 
         trailingStop.initTrail(mint, entryPriceSol);
-        riskManager.recordTrade({ pnlSol: 0 }); // catat trade count
+        riskManager.recordTrade({ pnlSol: 0 });
 
+        // 📢 Telegram notification
         const simTag = result.isSimulation ? ' <b>(SIMULASI)</b>' : '';
         await sendToChannel(
             `🤖 <b>AUTO-BUY EXECUTED</b>${simTag}\n` +
-            `━━━━━━━━━━━━━━━━━━━━━\n` +
             `🪙 <b>${esc(symbol)}</b>\n` +
-            `🎯 Score: <b>${scoreResult.score}/100</b> | Velocity: ${scoreResult.velocity} buys/min\n` +
-            `💰 ${amountSol} SOL → ${result.outputAmount.toFixed(0)} token\n` +
+            `🎯 Score: <b>${scoreResult.score}/100</b>\n` +
+            `💰 ${amountSol} SOL → ${result.outputAmount.toFixed(0)} tokens\n` +
             `📍 Entry: <code>${entryPriceSol.toFixed(8)}</code> SOL\n` +
-            `🛑 SL Awal: <code>${stopLossPriceSol.toFixed(8)}</code> (-${risk.maxLossPerTradePct}%)\n` +
-            `━━━━━━━━━━━━━━━━━━━━━\n` +
-            `🎯 TP1: 1.5x → jual 40% | SL → BEP\n` +
-            `🎯 TP2: 3.0x → jual 35% | trail -20%\n` +
-            `🎯 TP3: 5.0x+ → trail -15% sampai moon\n` +
-            `🔗 <a href="https://solscan.io/tx/${result.txid}">Solscan</a>`
+            `🔗 <a href="https://solscan.io/tx/${result.txid.slice(0, 100)}">TX</a>`
         );
 
+        console.log(`✅ AUTO-BUY SUCCESS: ${symbol} | ${result.outputAmount.toFixed(0)} tokens`);
         return result;
 
-    } catch (err) {
+    } catch (rawError) {
+        // 🛡️ ULTRA SAFE ERROR HANDLING
         buyLockSet.delete(mint);
-        if (err.graduated) {
-            console.log(`⏭️  Skip [${symbol}]: token graduate ke DEX`);
+        
+        let errorMsg = 'Unknown error';
+        let errorLogs = [];
+        let errorCode = 'UNKNOWN';
+        
+        // SAFE ERROR PARSING
+        if (rawError && typeof rawError === 'object') {
+            errorMsg = rawError.message || rawError.toString?.() || errorMsg;
+            errorLogs = Array.isArray(rawError.logs) ? rawError.logs : errorLogs;
+            errorCode = rawError.code || errorCode;
         } else {
-            console.error(`❌ Auto-buy gagal [${symbol}]:`, err.message);
+            errorMsg = rawError?.toString?.() || errorMsg;
         }
+
+        // SPECIAL CASES
+        if (errorMsg.includes('GRADUATED')) {
+            console.log(`⏭️ Skip [${symbol}]: graduated to DEX`);
+            return null;
+        }
+        if (errorMsg.includes('Token tidak terdeteksi')) {
+            console.log(`⏭️ Skip [${symbol}]: RPC delay`);
+            return null;
+        }
+
+        // LOGGING - 100% SAFE
+        console.error(`❌ Auto-buy gagal [${symbol}]: ${errorMsg}`);
+        if (errorLogs.length > 0) {
+            console.error(`📝 Logs:\n${errorLogs.join('\n')}`);
+        }
+
+        // NOTIF KE CHANNEL (SAFE)
+        if (!errorMsg.includes('Max posisi') && !errorMsg.includes('Risk rejected')) {
+            await sendToChannel(
+                `❌ <b>AUTO-BUY FAILED</b>\n` +
+                `🪙 ${esc(symbol)} | Score ${scoreResult.score}\n` +
+                `⚠️ ${esc(errorMsg.slice(0, 100))}${errorMsg.length > 100 ? '...' : ''}\n` +
+                `<i>${errorCode}</i>`
+            ).catch(() => {}); // Silent fail
+        }
+
         return null;
     }
 }

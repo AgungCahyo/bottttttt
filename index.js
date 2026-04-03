@@ -26,13 +26,28 @@ registerHandlers(bot);
 registerTradingHandlers(bot, isAdmin, requireAdmin);
 registerFallbackHandler(bot);
 
+// 🛡️ BULLETPROOF ERROR HANDLERS
+process.on('uncaughtException', (err) => {
+    const safeMsg = err?.message || 'Unknown crash';
+    console.error('💥 CRASH:', safeMsg);
+    console.error('💥 Stack:', err?.stack || 'No stack');
+    // JANGAN process.exit() - biarkan server jalan
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+    const safeMsg = reason?.message || reason?.toString?.() || 'Unknown promise rejection';
+    console.error('💥 PROMISE REJECT:', safeMsg);
+    console.error('💥 Promise:', promise);
+    // JANGAN process.exit()
+});
+
 async function start() {
     console.log('🚀 Memulai bot...');
     try {
         state.loadCache();
 
         console.log('--- INISIALISASI TRADING ENGINE ---');
-        tradingEngine.init({
+        await tradingEngine.init({
             rpcUrl:           CONFIG.SOLANA_RPC_URL,
             privateKeyBase58: CONFIG.PRIVATE_KEY_BASE58,
         });
@@ -40,11 +55,18 @@ async function start() {
 
         startPriceUpdater(120_000);
 
-        if (CONFIG.ENABLE_PUMP_RADAR) initPumpRadar();
-        else console.log('⛔ Pump Radar dinonaktifkan.');
+        if (CONFIG.ENABLE_PUMP_RADAR) {
+            console.log('📡 Menghubungkan ke Radar Pump.fun...');
+            initPumpRadar();
+        } else {
+            console.log('⛔ Pump Radar dinonaktifkan.');
+        }
 
-        if (CONFIG.ENABLE_NEWS_POLLING && CONFIG.NEWSDATA_API_KEY) startNewsPolling();
-        else console.log('⛔ News polling dinonaktifkan.');
+        if (CONFIG.ENABLE_NEWS_POLLING && CONFIG.NEWSDATA_API_KEY) {
+            startNewsPolling();
+        } else {
+            console.log('⛔ News polling dinonaktifkan.');
+        }
 
         console.log('--- INISIALISASI TELEGRAM ---');
         await bot.telegram.deleteWebhook({ drop_pending_updates: true }).catch(() => {});
@@ -52,8 +74,9 @@ async function start() {
         console.log('✅ Bot Telegram AKTIF!\n');
 
     } catch (err) {
-        console.error('💥 GAGAL startup:', err.message);
-        if (err.stack) console.error(err.stack);
+        const safeMsg = err?.message || 'Startup failed';
+        console.error('💥 GAGAL startup:', safeMsg);
+        console.error('💥 Detail:', err);
         process.exit(1);
     }
 }
@@ -63,13 +86,16 @@ app.listen(CONFIG.PORT, () => {
     start();
 });
 
+// 🛡️ SAFE SHUTDOWN
 ['SIGINT', 'SIGTERM'].forEach(sig => {
-    process.once(sig, () => {
+    process.once(sig, async () => {
         console.log(`\n🛑 ${sig} — shutdown...`);
-        bot.stop(sig);
+        try {
+            await tradingEngine.stop?.();
+            await bot.stop(sig);
+        } catch(e) {
+            console.log('⚠️ Shutdown warning:', e.message);
+        }
         process.exit(0);
     });
 });
-
-process.on('uncaughtException',  err => console.error('💥', err.message));
-process.on('unhandledRejection', err => console.error('💥', err));
