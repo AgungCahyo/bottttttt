@@ -1,14 +1,18 @@
 'use strict';
-const pump      = require('./pumpClient');
+const pump         = require('./pumpClient');
 const riskManager  = require('./risk/riskManager');
 const posTracker   = require('./positionTracker');
+const trailingStop = require('./trailingStop');
+const scorer       = require('./signalScorer');
 const dca          = require('./strategies/dca');
 const grid         = require('./strategies/grid');
 const { sendToChannel } = require('../services/telegram');
 const { esc } = require('../utils/helpers');
 
-const PRICE_CHECK_INTERVAL_MS = 120_000; // Cek harga tiap 120 detik
-const DCA_TICK_INTERVAL_MS    = 60_000; // DCA tick tiap 1 menit
+const PRICE_CHECK_INTERVAL_MS = 15_000;
+const DCA_TICK_INTERVAL_MS    = 60_000;
+
+const buyLockSet = new Set(); // cooldown per mint
 
 let initialized = false;
 
@@ -24,11 +28,12 @@ function init({ rpcUrl, privateKeyBase58 }) {
     dca.loadDcaPlans();
     grid.loadGridPlans();
 
-    // Stop loss / take profit event listeners
-    posTracker.on('stopLossTriggered', handleStopLoss);
-    posTracker.on('takeProfitTriggered', handleTakeProfit);
+    // Restore trailing state dari posisi yang sudah ada
+    for (const pos of posTracker.getAllPositions()) {
+        trailingStop.initTrail(pos.mint, pos.entryPriceSol);
+        console.log(`♻️  Trail restored: ${pos.symbol}`);
+    }
 
-    // Scheduler
     setInterval(dcaTick, DCA_TICK_INTERVAL_MS);
     setInterval(priceMonitorTick, PRICE_CHECK_INTERVAL_MS);
 
@@ -46,7 +51,6 @@ async function dcaTick() {
 
 // ============================================================
 // PRICE MONITOR TICK
-// Cek stop loss & take profit untuk semua posisi terbuka
 // ============================================================
 async function priceMonitorTick() {
     const positions = posTracker.getAllPositions();
@@ -55,101 +59,162 @@ async function priceMonitorTick() {
     for (const pos of positions) {
         try {
             const currentPrice = await pump.getTokenPriceInSol(pos.mint);
-            if (!currentPrice) continue;
+            if (!currentPrice || currentPrice <= 0) continue;
 
-            // Grid tick
             await grid.tick(pos.mint, currentPrice);
 
-            // Stop loss check
-            posTracker.checkStopLoss(pos.mint, currentPrice);
-            posTracker.checkTakeProfit(pos.mint, currentPrice);
+            const action = trailingStop.update(pos.mint, currentPrice);
+            if (action) await handleTrailAction(pos, action, currentPrice);
+
         } catch (err) {
-            console.error(`❌ Price monitor error [${pos.symbol}]:`, err.message);
+            if (!err.message?.includes('GRADUATED')) {
+                console.error(`❌ Price monitor [${pos.symbol}]:`, err.message);
+            }
         }
     }
 }
 
 // ============================================================
-// STOP LOSS HANDLER
+// HANDLE TRAIL ACTION
 // ============================================================
-async function handleStopLoss(pos) {
-    console.log(`🛑 STOP LOSS TRIGGERED: ${pos.symbol} @ ${pos.currentPriceSol?.toFixed(8)} SOL`);
+async function handleTrailAction(pos, action, currentPriceSol) {
+    const CONFIG = require('../config');
+
     try {
         const balance = await pump.getBalance(pos.mint);
         if (balance <= 0) return;
 
+        const sellTokens = Math.floor(balance * action.sellPct);
+        if (sellTokens <= 0) return;
+
         const result = await pump.executeSell({
-            inputMint:     pos.mint,
-            amountTokens:  balance,
-            slippageBps:   300,
-            isSimulation:  pos.isSimulation
+            inputMint:    pos.mint,
+            amountTokens: sellTokens,
+            slippageBps:  2000,
+            isSimulation: CONFIG.ENABLE_SIMULATION_MODE,
         });
 
-        const closed = posTracker.closePosition(pos.mint, {
-            exitPriceSol: pos.currentPriceSol,
-            reason: 'stop_loss',
-            txid: result.txid,
-        });
+        const pnlSol = (currentPriceSol - pos.entryPriceSol) * sellTokens;
+        const pnlPct = ((currentPriceSol / pos.entryPriceSol) - 1) * 100;
 
-        riskManager.recordTrade({ pnlSol: closed?.pnlSol || 0 });
+        if (action.remaining <= 0.02) {
+            posTracker.closePosition(pos.mint, {
+                exitPriceSol: currentPriceSol,
+                reason: action.phase,
+                txid: result.txid,
+            });
+            trailingStop.removeTrail(pos.mint);
+            riskManager.recordTrade({ pnlSol });
+        }
+
+        const emoji  = action.action === 'PARTIAL_SELL' ? '🎯' :
+                       action.action === 'TRAIL_STOP'   ? '📉' : '⚖️';
+        const simTag = CONFIG.ENABLE_SIMULATION_MODE ? ' <b>(SIM)</b>' : '';
 
         await sendToChannel(
-            `🛑 <b>STOP LOSS EXECUTED</b> ${pos.isSimulation ? '(SIMULASI)' : ''}\n` +
+            `${emoji} <b>${action.phase}</b>${simTag}\n` +
             `━━━━━━━━━━━━━━━━━━━━━\n` +
             `🪙 <b>${esc(pos.symbol)}</b>\n` +
-            `📍 Entry: ${pos.entryPriceSol?.toFixed(8)} SOL\n` +
-            `📉 Exit:  ${pos.currentPriceSol?.toFixed(8)} SOL\n` +
-            `💸 PnL: ${closed?.pnlSol >= 0 ? '+' : ''}${closed?.pnlSol?.toFixed(4)} SOL (${closed?.pnlPct?.toFixed(1)}%)\n` +
+            `📊 Multiplier: <b>${action.multiplier}x</b>\n` +
+            `💰 Dijual: ${(action.sellPct * 100).toFixed(0)}% posisi\n` +
+            `📈 PnL: ${pnlSol >= 0 ? '+' : ''}${pnlSol.toFixed(4)} SOL (${pnlPct.toFixed(1)}%)\n` +
+            (action.remaining > 0.02
+                ? `📦 Sisa: ${(action.remaining * 100).toFixed(0)}% masih trailing\n`
+                : `✅ Posisi ditutup\n`) +
+            (action.stopPrice ? `🛑 Trail stop: ${action.stopPrice.toFixed(8)} SOL\n` : '') +
             `🔗 <a href="https://solscan.io/tx/${result.txid}">Solscan</a>`
         );
+
+        console.log(`${emoji} ${action.phase}: ${pos.symbol} ${action.multiplier}x | sold ${(action.sellPct*100).toFixed(0)}%`);
+
     } catch (err) {
-        console.error('❌ Stop loss eksekusi gagal:', err.message);
-        await sendToChannel(`❌ <b>STOP LOSS GAGAL DIEKSEKUSI!</b>\n🪙 ${esc(pos.symbol)}\n⚠️ ${esc(err.message)}\n\n<b>Harap manual close posisi!</b>`);
+        console.error(`❌ Trail action gagal [${pos.symbol}]:`, err.message);
     }
 }
 
 // ============================================================
-// TAKE PROFIT HANDLER
+// AUTO BUY
 // ============================================================
-async function handleTakeProfit(pos) {
-    console.log(`🎯 TAKE PROFIT TRIGGERED: ${pos.symbol}`);
+async function executeAutoBuy(mint, symbol, token, scoreResult) {
+    const CONFIG = require('../config');
+
+    if (buyLockSet.has(mint)) return null;
+    if (posTracker.hasPosition(mint)) return null;
+
+    buyLockSet.add(mint);
+    setTimeout(() => buyLockSet.delete(mint), 30_000);
+
+    const amountSol = CONFIG.AUTO_BUY_AMOUNT_SOL;
+    const risk      = riskManager.getRiskConfig();
+
+    const validation = riskManager.validateBuy({ mint, amountSol });
+    if (!validation.allowed) {
+        console.warn(`⚠️  Auto-buy dibatalkan [${symbol}]: ${validation.reason}`);
+        buyLockSet.delete(mint);
+        return null;
+    }
+
+    console.log(`🤖 [${CONFIG.ENABLE_SIMULATION_MODE ? 'SIM' : 'REAL'}] AUTO-BUY: ${symbol} score=${scoreResult.score} | ${amountSol} SOL`);
+
     try {
-        const balance = await pump.getBalance(pos.mint);
-        if (balance <= 0) return;
-
-        const result = await pump.executeSell({
-            inputMint:     pos.mint,
-            amountTokens:  balance,
-            slippageBps:   200,
-            isSimulation:  pos.isSimulation
+        const result = await pump.executeSwap({
+            outputMint:     mint,
+            amountLamports: Math.floor(amountSol * 1e9),
+            slippageBps:    CONFIG.AUTO_BUY_SLIPPAGE_BPS,
+            isSimulation:   CONFIG.ENABLE_SIMULATION_MODE,
         });
 
-        const closed = posTracker.closePosition(pos.mint, {
-            exitPriceSol: pos.currentPriceSol,
-            reason: 'take_profit',
-            txid: result.txid,
+        if (!result || result.outputAmount <= 0) throw new Error('Output 0 token');
+
+        const entryPriceSol    = amountSol / result.outputAmount;
+        const stopLossPriceSol = entryPriceSol * (1 - risk.maxLossPerTradePct / 100);
+
+        posTracker.openPosition({
+            mint, symbol,
+            entryPriceSol,
+            stopLossPriceSol,
+            takeProfitPriceSol: null,
+            amountToken:  result.outputAmount,
+            amountSol,
+            strategy:    'AUTO',
+            txid:        result.txid,
+            isSimulation: !!result.isSimulation,
         });
 
-        riskManager.recordTrade({ pnlSol: closed?.pnlSol || 0 });
+        trailingStop.initTrail(mint, entryPriceSol);
 
+        const simTag = CONFIG.ENABLE_SIMULATION_MODE ? ' <b>(SIMULASI)</b>' : '';
         await sendToChannel(
-            `🎯 <b>TAKE PROFIT EXECUTED</b> ${pos.isSimulation ? '(SIMULASI)' : ''}\n` +
+            `🤖 <b>AUTO-BUY EXECUTED</b>${simTag}\n` +
             `━━━━━━━━━━━━━━━━━━━━━\n` +
-            `🪙 <b>${esc(pos.symbol)}</b>\n` +
-            `📍 Entry: ${pos.entryPriceSol?.toFixed(8)} SOL\n` +
-            `📈 Exit:  ${pos.currentPriceSol?.toFixed(8)} SOL\n` +
-            `💰 PnL: +${closed?.pnlSol?.toFixed(4)} SOL (+${closed?.pnlPct?.toFixed(1)}%)\n` +
+            `🪙 <b>${esc(symbol)}</b>\n` +
+            `🎯 Score: <b>${scoreResult.score}/100</b>\n` +
+            `⚡ Velocity: ${scoreResult.velocity} buys/min\n` +
+            `💰 Buy: ${amountSol} SOL → ${result.outputAmount.toFixed(0)} token\n` +
+            `📍 Entry: ${entryPriceSol.toFixed(8)} SOL\n` +
+            `🛑 SL: -${risk.maxLossPerTradePct}% (→ BEP setelah TP1)\n` +
+            `🎯 TP1: 1.5x → jual 40% | TP2: 3x → jual 35% | TP3: 5x+ trail 15%\n` +
             `🔗 <a href="https://solscan.io/tx/${result.txid}">Solscan</a>`
         );
+
+        return result;
+
     } catch (err) {
-        console.error('❌ Take profit eksekusi gagal:', err.message);
+        buyLockSet.delete(mint);
+        if (err.graduated) {
+            console.log(`⏭️  Skip [${symbol}]: Token graduate ke DEX`);
+            return null;
+        }
+        console.error(`❌ Auto-buy gagal [${symbol}]:`, err.message);
+        return null;
     }
 }
 
 // ============================================================
-// MANUAL CLOSE POSITION
+// MANUAL CLOSE
 // ============================================================
 async function manualClose(mint) {
+    const CONFIG = require('../config');
     const pos = posTracker.getPosition(mint);
     if (!pos) throw new Error('Posisi tidak ditemukan.');
 
@@ -157,103 +222,33 @@ async function manualClose(mint) {
     if (balance <= 0) throw new Error('Saldo token 0.');
 
     const result = await pump.executeSell({
-        inputMint:     mint,
-        amountTokens:  balance,
-        slippageBps:   200,
-        isSimulation:  pos.isSimulation
+        inputMint:    mint,
+        amountTokens: balance,
+        slippageBps:  300,
+        isSimulation: CONFIG.ENABLE_SIMULATION_MODE,
     });
 
-    const currentPrice = pos.entryPriceSol * (result.outputAmount / pos.amountSol);
+    const currentPrice = await pump.getTokenPriceInSol(mint) || pos.entryPriceSol;
     const closed = posTracker.closePosition(mint, {
         exitPriceSol: currentPrice,
         reason: 'manual',
         txid: result.txid,
     });
 
+    trailingStop.removeTrail(mint);
     riskManager.recordTrade({ pnlSol: closed?.pnlSol || 0 });
     return { ...closed, txid: result.txid };
 }
 
-// ============================================================
-// AUTO BUY (Pump.fun Mooner Trigger)
-// ============================================================
-async function executeAutoBuy(mint, symbol, amountSol) {
-    const CONFIG = require('../config');
-    const risk   = riskManager.getRiskConfig();
-
-    // Cegah double-buy
-    if (posTracker.hasPosition(mint)) {
-        console.log(`⏭️  Skip [${symbol}]: Posisi sudah terbuka`);
-        return null;
-    }
-
-    console.log(`🤖 [${CONFIG.ENABLE_SIMULATION_MODE ? 'SIMULASI' : 'REAL'}] Mencoba AUTO-BUY: ${symbol} (${amountSol} SOL)`);
-
-    // 1. Validasi risk management
-    const validation = riskManager.validateBuy({ mint, amountSol });
-    if (!validation.allowed) {
-        console.warn(`⚠️ Auto-buy dibatalkan: ${validation.reason}`);
-        return null;
-    }
-
-    try {
-        // 2. Eksekusi swap (pump SDK)
-        const result = await pump.executeSwap({
-            outputMint:    mint,
-            amountLamports: Math.floor(amountSol * 1e9),
-            slippageBps:   CONFIG.AUTO_BUY_SLIPPAGE_BPS,
-            isSimulation:  CONFIG.ENABLE_SIMULATION_MODE
-        });
-
-        // 3. Hitung harga entry & SL/TP
-        const entryPriceSol      = amountSol / result.outputAmount;
-        const stopLossPriceSol   = entryPriceSol * (1 - (risk.maxLossPerTradePct / 100));
-        const takeProfitPriceSol = entryPriceSol * 2; // Target 2x (Moonshot)
-
-        // 4. Buka posisi di tracker
-        posTracker.openPosition({
-            mint,
-            symbol,
-            entryPriceSol,
-            stopLossPriceSol,
-            takeProfitPriceSol,
-            amountToken:  result.outputAmount,
-            amountSol:    amountSol,
-            txid:         result.txid,
-            isSimulation: !!result.isSimulation
-        });
-
-        // 5. Notifikasi Telegram
-        await sendToChannel(
-            `🤖 <b>AUTO-BUY EXECUTED</b> ${CONFIG.ENABLE_SIMULATION_MODE ? '(SIMULASI)' : ''}\n` +
-            `━━━━━━━━━━━━━━━━━━━━━\n` +
-            `🪙 <b>${esc(symbol)}</b>\n` +
-            `💰 Amount: ${amountSol} SOL\n` +
-            `📊 Entry:  ${entryPriceSol.toFixed(8)} SOL\n` +
-            `🛑 SL:     ${stopLossPriceSol.toFixed(8)} SOL (-${risk.maxLossPerTradePct}%)\n` +
-            `🎯 TP:     ${takeProfitPriceSol.toFixed(8)} SOL (2x)\n` +
-            `🔗 <a href="https://solscan.io/tx/${result.txid}">Solscan</a>`
-        );
-
-        return result;
-    } catch (err) {
-    // Token sudah graduate ke DEX — skip diam-diam
-    if (err.graduated) {
-        console.log(`⏭️  Skip [${symbol}]: Token sudah graduate ke DEX`);
-        return null;
-    }
-    console.error(`❌ Auto-buy gagal [${symbol}]:`, err.message);
-    return null;
-}
-}
-
 module.exports = {
     init,
-    manualClose,
     executeAutoBuy,
+    manualClose,
     dca,
     grid,
     posTracker,
     riskManager,
+    trailingStop,
+    scorer,
     pump,
 };
