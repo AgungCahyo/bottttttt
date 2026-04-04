@@ -1,6 +1,7 @@
 'use strict';
 const fs   = require('fs');
 const path = require('path');
+const CONFIG = require('../../config');
 
 const RISK_FILE = path.join(__dirname, '../../../trading_risk.json');
 
@@ -10,9 +11,9 @@ const RISK_FILE = path.join(__dirname, '../../../trading_risk.json');
 // ============================================================
 const DEFAULT_RISK = {
     // Per-trade
-    maxLossPerTradePct:  50,     // SL -50% (meme coin sangat volatile)
+    maxLossPerTradePct:  15,     // SL -15% (lebih aman untuk disiplin)
     maxBuyAmountSol:     0.5,
-    minBuyAmountSol:     0.01,
+    minBuyAmountSol:     0.001,
 
     // Harian
     dailyLossLimitSol:   2.0,
@@ -66,6 +67,12 @@ function loadRiskConfig() {
         }
     } catch (err) {
         console.warn('⚠️ Gagal load risk config:', err.message);
+    }
+    // Samakan min buy dengan AUTO_BUY: file lama sering punya min 0.01 padahal .env 0.001
+    const auto = CONFIG.AUTO_BUY_AMOUNT_SOL;
+    if (Number.isFinite(auto) && auto > 0 && riskConfig.minBuyAmountSol > auto) {
+        riskConfig.minBuyAmountSol = auto;
+        console.log(`🛡️  minBuyAmountSol diselaraskan ke AUTO_BUY (${auto} SOL).`);
     }
 }
 

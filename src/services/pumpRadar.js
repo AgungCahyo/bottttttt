@@ -10,6 +10,7 @@ const { sendToChannel } = require('./telegram');
 const tradingEngine = require('../trading/tradingEngine');
 
 const WS_URL = 'wss://pumpportal.fun/api/data';
+let activeWs = null;
 
 // ============================================================
 // TOKEN TRACKING FACTORY
@@ -122,22 +123,10 @@ async function handleTrade(event) {
         }
     }
 
-    // ─── PROFIT TRACKER ────────────────────────────────────────
-    if (token.isAlerted && token.alertMCapSol > 0) {
-        const multiplier      = mcapSol / token.alertMCapSol;
-        const wholeMultiplier = Math.floor(multiplier);
-
-        if (wholeMultiplier >= 2 && !token.milestones.has(wholeMultiplier)) {
-            token.milestones.add(wholeMultiplier);
-
-            const message  = formatCallConfirmed(event.mint, token, mcapSol, multiplier, curve, state.currentSolPrice);
-            const keyboard = Markup.inlineKeyboard([
-                [Markup.button.url('💰 Take Profit (Axiom)', `https://axiom.trade/t/${event.mint}`)],
-                [Markup.button.url('🔭 Photon', `https://photon-sol.tinyastro.io/en/lp/${event.mint}`)],
-            ]);
-            await sendToChannel(message, keyboard);
-            console.log(`🔥 PROFIT: ${token.symbol} ${wholeMultiplier}x`);
-        }
+    // ─── STREAMING PRICE UPDATE ────────────────────────────────
+    // Jika koin ini sedang kita pegang (posisi terbuka), langsung gas update harga
+    if (tradingEngine.posTracker.hasPosition(event.mint)) {
+        tradingEngine.handleStreamPrice(event.mint, mcapSol / CONFIG.PUMP_TOTAL_SUPPLY);
     }
 }
 
@@ -195,10 +184,18 @@ function formatEarlySignalWithScore(mint, data, mcapSol, curve, scoreResult) {
 function initPumpRadar() {
     console.log('📡 Menghubungkan ke Radar Pump.fun...');
     const ws = new WebSocket(WS_URL);
+    activeWs = ws;
 
     ws.on('open', () => {
         console.log('✅ Radar Pump.fun TERKONEKSI!');
         ws.send(JSON.stringify({ method: 'subscribeNewToken' }));
+
+        // Re-subscribe ke posisi terbuka jika ada (setelah restart)
+        const openMints = tradingEngine.posTracker.getAllPositions().map(p => p.mint);
+        if (openMints.length > 0) {
+            console.log(`📡 Re-subscribing ke ${openMints.length} posisi terbuka...`);
+            ws.send(JSON.stringify({ method: 'subscribeTokenTrade', keys: openMints }));
+        }
     });
 
     ws.on('message', async (raw) => {
@@ -213,6 +210,7 @@ function initPumpRadar() {
     });
 
     ws.on('close', () => {
+        activeWs = null;
         console.warn('⚠️  Radar terputus. Reconnect dalam 5 detik...');
         setTimeout(initPumpRadar, 5_000);
     });
@@ -220,4 +218,19 @@ function initPumpRadar() {
     ws.on('error', err => console.error('❌ Radar error:', err.message));
 }
 
-module.exports = { initPumpRadar };
+function subscribeToMint(mint) {
+    if (activeWs && activeWs.readyState === WebSocket.OPEN) {
+        activeWs.send(JSON.stringify({ method: 'subscribeTokenTrade', keys: [mint] }));
+    }
+}
+
+function unsubscribeFromMint(mint) {
+    // HANYA unsubscribe jika koin tidak sedang di-track oleh radar (state.trackedTokens)
+    if (state.trackedTokens.has(mint)) return;
+
+    if (activeWs && activeWs.readyState === WebSocket.OPEN) {
+        activeWs.send(JSON.stringify({ method: 'unsubscribeTokenTrade', keys: [mint] }));
+    }
+}
+
+module.exports = { initPumpRadar, subscribeToMint, unsubscribeFromMint };

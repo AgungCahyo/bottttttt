@@ -39,14 +39,24 @@ function savePositions() {
 // CRUD POSITIONS
 // ============================================================
 function openPosition(data) {
+    const initialAmountToken = data.initialAmountToken != null ? data.initialAmountToken : data.amountToken;
     positions.set(data.mint, {
         ...data,
+        initialAmountToken,
         openedAt: Date.now(),
         status: 'open',
     });
     savePositions();
     console.log(`📈 Posisi dibuka: ${data.symbol} @ ${data.entryPriceSol?.toFixed(8)} SOL`);
     emitter.emit('opened', data);
+}
+
+function patchPosition(mint, updates) {
+    const pos = positions.get(mint);
+    if (!pos) return null;
+    Object.assign(pos, updates);
+    savePositions();
+    return pos;
 }
 
 function closePosition(mint, { exitPriceSol, reason = 'manual', txid = null }) {
@@ -102,6 +112,7 @@ function checkTakeProfit(mint, currentPriceSol) {
 module.exports = {
     loadPositions,
     openPosition,
+    patchPosition,
     closePosition,
     getPosition,
     getAllPositions,

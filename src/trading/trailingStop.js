@@ -14,9 +14,9 @@
 
 const TRAIL_PHASES = [
     // { multiplier: trigger x dari entry, sellPct: % posisi dijual, trailPct: trailing % setelah ini }
-    { multiplier: 1.5, sellPct: 0.40, trailPct: 0.25, label: 'TP1' },
-    { multiplier: 3.0, sellPct: 0.35, trailPct: 0.20, label: 'TP2' },
-    { multiplier: 5.0, sellPct: 0.00, trailPct: 0.15, label: 'TP3 (trail ketat)' },
+    { multiplier: 1.3, sellPct: 0.40, trailPct: 0.20, label: 'TP1 (1.3x)' },
+    { multiplier: 2.0, sellPct: 0.30, trailPct: 0.15, label: 'TP2 (2x)' },
+    { multiplier: 4.0, sellPct: 0.00, trailPct: 0.10, label: 'TP3 (4x, trail ketat)' },
 ];
 
 // ============================================================

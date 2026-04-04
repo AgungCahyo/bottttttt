@@ -12,13 +12,14 @@ const { esc, sleep }    = require('../utils/helpers');
 // ============================================================
 // CONSTANTS
 // ============================================================
-const PRICE_CHECK_INTERVAL_MS  = 20_000;  // cek harga tiap 20 detik
+const PRICE_CHECK_INTERVAL_MS  = 3_000;   // cek harga tiap 3 detik
 const DCA_TICK_INTERVAL_MS     = 60_000;
 const MAX_POSITIONS            = 10;       // maksimal posisi terbuka bersamaan
 const PRICE_REQUEST_DELAY_MS   = 1_200;   // jeda antar token saat cek harga
 const MAX_POSITION_AGE_MS      = 3_600_000; // auto-close posisi simulasi > 1 jam
 
 const buyLockSet = new Set();
+const stopLossInflight = new Set();
 let initialized  = false;
 let isSimMode    = true; // ditentukan saat init
 
@@ -65,6 +66,21 @@ function init({ rpcUrl, privateKeyBase58 }) {
 
     initialized = true;
     console.log(`✅ Trading Engine aktif — wallet: ${walletAddress}`);
+
+    // --- POS EVENT LISTENERS (Streaming Subscriptions) ---
+    posTracker.on('opened', (pos) => {
+        try {
+            const radar = require('../services/pumpRadar');
+            radar.subscribeToMint(pos.mint);
+        } catch (err) { /* silent */ }
+    });
+
+    posTracker.on('closed', (pos) => {
+        try {
+            const radar = require('../services/pumpRadar');
+            radar.unsubscribeFromMint(pos.mint);
+        } catch (err) { /* silent */ }
+    });
 }
 
 // ============================================================
@@ -105,7 +121,37 @@ async function dcaTick() {
 }
 
 // ============================================================
-// PRICE MONITOR — Rate-limited, sequential per posisi
+// STREAM PRICE HANDLER (Real-time from WebSocket)
+// ============================================================
+async function handleStreamPrice(mint, currentPrice) {
+    if (!initialized) return;
+    const pos = posTracker.getPosition(mint);
+    if (!pos) return;
+
+    try {
+        // 1. Cek Stop Loss
+        if (pos.stopLossPriceSol && currentPrice <= pos.stopLossPriceSol) {
+            console.log(`📡 [STREAM] SL Triggered: ${pos.symbol} @ ${currentPrice.toFixed(8)}`);
+            await executeStopLossClose(pos, currentPrice);
+            return;
+        }
+
+        // 2. Grid logic
+        await grid.tick(mint, currentPrice);
+
+        // 3. Trailing Stop
+        const action = trailingStop.update(mint, currentPrice);
+        if (action) {
+            console.log(`📡 [STREAM] Trail Action: ${pos.symbol} -> ${action.action}`);
+            await handleTrailAction(pos, action, currentPrice);
+        }
+    } catch (err) {
+        // fail silently in stream to avoid log spam
+    }
+}
+
+// ============================================================
+// PRICE MONITOR (Polling Backup)
 // ============================================================
 async function priceMonitorTick() {
     const positions = posTracker.getAllPositions();
@@ -115,6 +161,12 @@ async function priceMonitorTick() {
         try {
             const currentPrice = await pump.getTokenPriceInSol(pos.mint);
             if (!currentPrice || currentPrice <= 0) {
+                await sleep(PRICE_REQUEST_DELAY_MS);
+                continue;
+            }
+
+            if (pos.stopLossPriceSol && currentPrice <= pos.stopLossPriceSol) {
+                await executeStopLossClose(pos, currentPrice);
                 await sleep(PRICE_REQUEST_DELAY_MS);
                 continue;
             }
@@ -139,6 +191,56 @@ async function priceMonitorTick() {
 }
 
 // ============================================================
+// STOP LOSS — statis (risk.maxLossPerTradePct), tidak pernah terhubung sebelumnya
+// ============================================================
+
+// ============================================================
+// STOP LOSS — statis (risk.maxLossPerTradePct), tidak pernah terhubung sebelumnya
+// ============================================================
+async function executeStopLossClose(pos, currentPriceSol) {
+    const CONFIG = require('../config');
+    const mint = pos.mint;
+    if (stopLossInflight.has(mint)) return;
+    stopLossInflight.add(mint);
+    trailingStop.removeTrail(mint);
+    try {
+        const balance = await pump.getBalance(mint);
+        if (!balance || balance <= 0) {
+            posTracker.closePosition(mint, { exitPriceSol: currentPriceSol, reason: 'stop_loss_empty' });
+            return;
+        }
+        const result = await pump.executeSell({
+            inputMint:    mint,
+            amountTokens: balance,
+            slippageBps:  3000,
+            isSimulation: pos.isSimulation || CONFIG.ENABLE_SIMULATION_MODE,
+        });
+        const pnlSol = (currentPriceSol - pos.entryPriceSol) * balance;
+        posTracker.closePosition(mint, {
+            exitPriceSol: currentPriceSol,
+            reason:       'stop_loss',
+            txid:         result.txid,
+        });
+        riskManager.recordTrade({ pnlSol });
+        await sendToChannel(
+            `🛑 <b>STOP LOSS</b>\n🪙 ${esc(pos.symbol)}\n` +
+            `📉 Harga: <code>${currentPriceSol.toFixed(8)}</code> ≤ SL\n` +
+            `📊 PnL: ${pnlSol >= 0 ? '+' : ''}${pnlSol.toFixed(4)} SOL\n` +
+            `🔗 <a href="https://solscan.io/tx/${result.txid}">Solscan</a>`
+        ).catch(() => {});
+        console.log(`🛑 Stop loss: ${pos.symbol} | PnL ${pnlSol.toFixed(4)} SOL`);
+    } catch (e) {
+        const msg = e?.message || String(e);
+        console.error(`❌ Stop loss gagal [${pos.symbol}]:`, msg);
+        await sendToChannel(
+            `⚠️ <b>STOP LOSS GAGAL</b>\n🪙 ${esc(pos.symbol)}\n❗ ${esc(msg.slice(0, 120))}`
+        ).catch(() => {});
+    } finally {
+        stopLossInflight.delete(mint);
+    }
+}
+
+// ============================================================
 // HANDLE TRAIL ACTION (Partial Sell / Trail Stop / Breakeven)
 // ============================================================
 async function handleTrailAction(pos, action, currentPriceSol) {
@@ -147,14 +249,18 @@ async function handleTrailAction(pos, action, currentPriceSol) {
     try {
         const balance = await pump.getBalance(pos.mint);
         if (!balance || balance <= 0) {
-            // Token habis, tutup posisi saja
             posTracker.closePosition(pos.mint, { exitPriceSol: currentPriceSol, reason: 'zero_balance' });
             trailingStop.removeTrail(pos.mint);
             return;
         }
 
-        // Hitung jumlah token yang dijual
-        const sellTokens = balance * action.sellPct;
+        let sellTokens;
+        if (action.action === 'TRAIL_STOP' || action.action === 'BREAKEVEN_STOP') {
+            sellTokens = balance;
+        } else {
+            const initial = pos.initialAmountToken ?? pos.amountToken;
+            sellTokens = Math.min(balance, initial * action.sellPct);
+        }
         if (sellTokens <= 0) return;
 
         const result = await pump.executeSell({
@@ -168,7 +274,11 @@ async function handleTrailAction(pos, action, currentPriceSol) {
         const pnlPct = ((currentPriceSol / pos.entryPriceSol) - 1) * 100;
         const simTag = (pos.isSimulation || CONFIG.ENABLE_SIMULATION_MODE) ? ' <b>(SIM)</b>' : '';
 
-        // Tutup posisi jika sisa sudah habis
+        if (action.remaining > 0.02) {
+            const newBal = await pump.getBalance(pos.mint);
+            posTracker.patchPosition(pos.mint, { amountToken: newBal });
+        }
+
         if (action.remaining <= 0.02) {
             posTracker.closePosition(pos.mint, {
                 exitPriceSol: currentPriceSol,
@@ -180,42 +290,44 @@ async function handleTrailAction(pos, action, currentPriceSol) {
         }
 
         const emoji = action.action === 'PARTIAL_SELL' ? '🎯' :
-                      action.action === 'TRAIL_STOP'   ? '📉' : '⚖️';
+            action.action === 'TRAIL_STOP' ? '📉' : '⚖️';
+
+        const sellLabel = action.action === 'PARTIAL_SELL'
+            ? `${(action.sellPct * 100).toFixed(0)}% dari ukuran entry awal`
+            : 'seluruh sisa token';
 
         await sendToChannel(
             `${emoji} <b>${action.phase}</b>${simTag}\n` +
             `━━━━━━━━━━━━━━━━━━━━━\n` +
             `🪙 <b>${esc(pos.symbol)}</b>\n` +
             `📊 <b>${action.multiplier}x</b> dari entry\n` +
-            `💰 Dijual: ${(action.sellPct * 100).toFixed(0)}% posisi\n` +
+            `💰 Dijual: ${sellLabel}\n` +
             `📈 PnL batch: ${pnlSol >= 0 ? '+' : ''}${pnlSol.toFixed(4)} SOL (${pnlPct.toFixed(1)}%)\n` +
             (action.remaining > 0.02
-                ? `📦 Sisa: ${(action.remaining * 100).toFixed(0)}% masih trailing\n`
+                ? `📦 Sisa: ${(action.remaining * 100).toFixed(0)}% dari entry awal (trailing)\n`
                 : `✅ Posisi DITUTUP PENUH\n`) +
-            (action.stopPrice ? `🛑 Trail stop baru: ${action.stopPrice.toFixed(8)} SOL\n` : '') +
+            (action.stopPrice ? `🛑 Trail stop: ${action.stopPrice.toFixed(8)} SOL\n` : '') +
             `🔗 <a href="https://solscan.io/tx/${result.txid}">Solscan</a>`
         );
 
-        console.log(`${emoji} ${action.phase}: ${pos.symbol} @${action.multiplier}x | -${(action.sellPct*100).toFixed(0)}%`);
+        console.log(`${emoji} ${action.phase}: ${pos.symbol} @${action.multiplier}x`);
 
     } catch (rawError) {
-    // 🛡️ SAFE ERROR HANDLING
-    let errorMsg = 'Trail action failed';
-    if (rawError && typeof rawError === 'object') {
-        errorMsg = rawError.message || rawError.toString?.() || errorMsg;
-    } else {
-        errorMsg = rawError?.toString?.() || errorMsg;
+        let errorMsg = 'Trail action failed';
+        if (rawError && typeof rawError === 'object') {
+            errorMsg = rawError.message || rawError.toString?.() || errorMsg;
+        } else {
+            errorMsg = rawError?.toString?.() || errorMsg;
+        }
+
+        console.error(`❌ Trail action gagal [${pos.symbol}]: ${errorMsg}`);
+
+        if (!errorMsg.includes('GRADUATED') && !errorMsg.includes('0')) {
+            await sendToChannel(
+                `⚠️ <b>TRAIL FAILED</b>\n🪙 ${esc(pos.symbol)}\n❗ ${errorMsg.slice(0, 100)}`
+            ).catch(() => {});
+        }
     }
-    
-    console.error(`❌ Trail action gagal [${pos.symbol}]: ${errorMsg}`);
-    
-    // Notif hanya jika bukan error biasa
-    if (!errorMsg.includes('GRADUATED') && !errorMsg.includes('0')) {
-        await sendToChannel(
-            `⚠️ <b>TRAIL FAILED</b>\n🪙 ${esc(pos.symbol)}\n❗ ${errorMsg.slice(0, 100)}`
-        ).catch(() => {});
-    }
-}
 }
 
 // ============================================================
@@ -296,6 +408,7 @@ async function executeAutoBuy(mint, symbol, token, scoreResult) {
             stopLossPriceSol,
             takeProfitPriceSol: null,
             amountToken: result.outputAmount,
+            initialAmountToken: result.outputAmount,
             amountSol,
             strategy: 'AUTO',
             txid: result.txid,
@@ -445,6 +558,7 @@ module.exports = {
     manualClose,
     closeAllPositions,
     clearSimPositions,
+    handleStreamPrice,
     isSimMode: () => isSimMode,
     dca,
     grid,

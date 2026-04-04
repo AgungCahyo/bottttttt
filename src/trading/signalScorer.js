@@ -1,15 +1,20 @@
 'use strict';
 
+const CONFIG = require('../config');
+
 // ============================================================
 // SIGNAL SCORER
 // Hitung skor kualitas token sebelum auto-buy.
 // Tujuan: filter token sampah, naikkan winrate.
 //
-// Skor 0-100. AUTO-BUY hanya jika skor >= MIN_SCORE
+// Skor 0-100. AUTO-BUY hanya jika skor >= SIGNAL_MIN_SCORE (.env)
 // dan tidak ada flag HARD REJECT.
 // ============================================================
 
-const MIN_SCORE_TO_BUY = 55; // Threshold minimum untuk auto-buy
+function minScoreToBuy() {
+    const n = CONFIG.SIGNAL_MIN_SCORE;
+    return Number.isFinite(n) && n >= 0 && n <= 100 ? n : 55;
+}
 
 // ============================================================
 // HARD REJECT — langsung gagal tanpa hitung skor
@@ -122,7 +127,8 @@ function evaluate(token) {
     const rejects   = getHardRejects(token, timeDiffSec);
     const { total, breakdown, velocity } = calcScore(token, timeDiffSec);
 
-    const shouldBuy = rejects.length === 0 && total >= MIN_SCORE_TO_BUY;
+    const minS = minScoreToBuy();
+    const shouldBuy = rejects.length === 0 && total >= minS;
 
     return {
         shouldBuy,
@@ -130,8 +136,8 @@ function evaluate(token) {
         rejects,
         breakdown,
         velocity,
-        minScore: MIN_SCORE_TO_BUY,
+        minScore: minS,
     };
 }
 
-module.exports = { evaluate, MIN_SCORE_TO_BUY };
+module.exports = { evaluate, minScoreToBuy };

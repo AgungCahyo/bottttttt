@@ -46,6 +46,8 @@ const CONFIG = {
     ENABLE_SIMULATION_MODE: process.env.ENABLE_SIMULATION_MODE !== 'false', // default: true
     AUTO_BUY_AMOUNT_SOL:    parseFloat(process.env.AUTO_BUY_AMOUNT_SOL || '0.1'),
     AUTO_BUY_SLIPPAGE_BPS:  parseInt(process.env.AUTO_BUY_SLIPPAGE_BPS   || '1500', 10), // 15%
+    /** Skor minimum radar untuk auto-buy (55 = longgar, 70+ = lebih selektif, bukan jaminan win) */
+    SIGNAL_MIN_SCORE:       parseInt(process.env.SIGNAL_MIN_SCORE || '55', 10),
 
     // Feature Flags
     ENABLE_SOLANA_STREAM: process.env.ENABLE_SOLANA_STREAM === 'true',
@@ -59,6 +61,7 @@ console.log(`   Channel       : ${CONFIG.TELEGRAM_CHANNEL_ID}`);
 console.log(`   Port          : ${CONFIG.PORT}`);
 console.log(`   Simulation    : ${CONFIG.ENABLE_SIMULATION_MODE ? '🛡️ AKTIF (Tanpa SOL Asli)' : '💸 NONAKTIF (Menggunakan SOL Asli!)'}`);
 console.log(`   Auto-Buy      : ${CONFIG.AUTO_BUY_AMOUNT_SOL} SOL (Slippage: ${CONFIG.AUTO_BUY_SLIPPAGE_BPS / 100}%)`);
+console.log(`   Min skor buy  : ${CONFIG.SIGNAL_MIN_SCORE}/100`);
 console.log(`   News polling  : ${CONFIG.ENABLE_NEWS_POLLING ? `✅ setiap ${CONFIG.NEWS_INTERVAL_MS / 60_000} mnt` : '⛔ nonaktif'}`);
 console.log(`   Pump radar    : ${CONFIG.ENABLE_PUMP_RADAR   ? '✅' : '⛔ nonaktif'}`);
 console.log(`   Solana stream : ${CONFIG.ENABLE_SOLANA_STREAM ? '✅' : '⛔ nonaktif'}`);
