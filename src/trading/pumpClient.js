@@ -250,9 +250,11 @@ async function bondingCurveBuy({ outputMint, amountLamports, slippageBps = 1500,
 
     log.rpc(`[BC] Buy ${solAmt.toFixed(4)} SOL → ${mintStr}`);
 
+    const CONFIG = require('../config');
+    const bufSol = CONFIG.MIN_SOL_BUFFER_SOL;
     const bal = await getSolBalance();
-    if (bal < solAmt + 0.02) {
-        throw createSafeError(`SOL kurang: ${bal.toFixed(4)} (butuh ${(solAmt + 0.02).toFixed(4)})`, { code: 'INSUFFICIENT_FUNDS' });
+    if (bal < solAmt + bufSol) {
+        throw createSafeError(`SOL kurang: ${bal.toFixed(4)} (butuh ${(solAmt + bufSol).toFixed(4)})`, { code: 'INSUFFICIENT_FUNDS' });
     }
 
     let mintInfo = null;
@@ -525,8 +527,10 @@ async function pumpswapBuy({ outputMint, amountLamports, slippageBps = 1500, pri
     const solAmt   = amountLamports / LAMPORTS_PER_SOL;
     log.rpc(`[AMM] PumpSwap buy ${solAmt.toFixed(4)} SOL → ${baseMint.toBase58().slice(0, 8)}…`);
 
+    const CONFIG = require('../config');
+    const bufSol = CONFIG.MIN_SOL_BUFFER_SOL;
     const bal = await getSolBalance();
-    if (bal < solAmt + 0.025) throw createSafeError(`SOL kurang: ${bal.toFixed(4)}`, { code: 'INSUFFICIENT_FUNDS' });
+    if (bal < solAmt + bufSol) throw createSafeError(`SOL kurang: ${bal.toFixed(4)} (butuh ${(solAmt + bufSol).toFixed(4)})`, { code: 'INSUFFICIENT_FUNDS' });
 
     const pool = await findPool(baseMint);
 

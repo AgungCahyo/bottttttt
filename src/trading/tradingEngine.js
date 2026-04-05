@@ -195,6 +195,8 @@ async function handleStreamPrice(mint, currentPrice) {
 
         // 1. Stop loss dari stream: rata-rata window (kurangi panic pada wick tunggal)
         if (pos.stopLossPriceSol && buf.length >= minSamples && avg != null && avg <= pos.stopLossPriceSol) {
+            // Wajib sebelum log: hindari spam log saat sell SL masih berjalan (banyak tick WS)
+            if (stopLossInflight.has(mint)) return;
             log.stream(`SL (avg ${avg.toFixed(8)} ≤ SL) ${pos.symbol}`);
             await executeStopLossClose(pos, avg);
             return;
@@ -230,7 +232,9 @@ async function priceMonitorTick() {
             }
 
             if (pos.stopLossPriceSol && currentPrice <= pos.stopLossPriceSol) {
-                await executeStopLossClose(pos, currentPrice);
+                if (!stopLossInflight.has(pos.mint)) {
+                    await executeStopLossClose(pos, currentPrice);
+                }
                 await sleep(PRICE_REQUEST_DELAY_MS);
                 continue;
             }
@@ -436,9 +440,9 @@ async function executeAutoBuy(mint, symbol, token, scoreResult) {
     if (!CONFIG.ENABLE_SIMULATION_MODE) {
         try {
             const solBal = await pump.getSolBalance();
-            const needed = amountSol + 0.02;
+            const needed = amountSol + CONFIG.MIN_SOL_BUFFER_SOL;
             if (solBal < needed) {
-                log.warn(`SOL kurang: ${solBal.toFixed(4)} < ${needed.toFixed(4)}`);
+                log.warn(`SOL kurang: ${solBal.toFixed(4)} < ${needed.toFixed(4)} (buy ${amountSol} + buffer ${CONFIG.MIN_SOL_BUFFER_SOL})`);
                 buyLockSet.delete(mint);
                 return null;
             }

@@ -47,6 +47,14 @@ const CONFIG = {
     ENABLE_SIMULATION_MODE: process.env.ENABLE_SIMULATION_MODE !== 'false', // default: true
     AUTO_BUY_AMOUNT_SOL:    parseFloat(process.env.AUTO_BUY_AMOUNT_SOL || '0.1'),
     AUTO_BUY_SLIPPAGE_BPS:  parseInt(process.env.AUTO_BUY_SLIPPAGE_BPS   || '1500', 10), // 15%
+    /**
+     * Cadangan SOL minimum di atas jumlah beli (biaya tx, CU, rent ATA).
+     * Cek: saldo ≥ AUTO_BUY_AMOUNT_SOL + MIN_SOL_BUFFER_SOL. Turunkan jika saldo kecil (risiko tx gagal).
+     */
+    MIN_SOL_BUFFER_SOL: (() => {
+        const v = parseFloat(process.env.MIN_SOL_BUFFER_SOL || '0.02');
+        return Number.isFinite(v) && v >= 0 ? v : 0.02;
+    })(),
     /** Skor minimum radar untuk auto-buy (55 = longgar, 70+ = lebih selektif, bukan jaminan win) */
     SIGNAL_MIN_SCORE:       parseInt(process.env.SIGNAL_MIN_SCORE || '55', 10),
 
@@ -78,6 +86,7 @@ log.cfgRow('Channel', CONFIG.TELEGRAM_CHANNEL_ID);
 log.cfgRow('Port', String(CONFIG.PORT));
 log.cfgRow('Simulation', CONFIG.ENABLE_SIMULATION_MODE ? log.stateSim() : log.stateLive());
 log.cfgRow('Auto-Buy', `${CONFIG.AUTO_BUY_AMOUNT_SOL} SOL (slippage ${CONFIG.AUTO_BUY_SLIPPAGE_BPS / 100}%)`);
+log.cfgRow('Min SOL buffer (real)', `${CONFIG.MIN_SOL_BUFFER_SOL} SOL`);
 log.cfgRow('Min skor buy', `${CONFIG.SIGNAL_MIN_SCORE}/100`);
 log.cfgRow(
     'News polling',
