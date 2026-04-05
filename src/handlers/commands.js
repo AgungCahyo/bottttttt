@@ -4,6 +4,7 @@ const state   = require('../config/state');
 const { formatUptime } = require('../utils/helpers');
 const { sendToChannel } = require('../services/telegram');
 const { fetchCryptoNews } = require('../services/news');
+const f   = require('../utils/tgFormat');
 const log = require('../utils/logger');
 
 // ============================================================
@@ -15,23 +16,29 @@ function isAdmin(ctx) {
 }
 
 function requireAdmin(ctx, next) {
-    if (!isAdmin(ctx)) return ctx.reply('🚫 Hanya untuk admin.');
+    if (!isAdmin(ctx)) return ctx.reply('Access denied.');
     return next();
 }
 
 // ============================================================
-// STATUS HELPER
+// STATUS MESSAGE
 // ============================================================
 function buildStatusMessage() {
+    const up = formatUptime(state.stats.botStartTime);
     return (
-        `<b>📊 Status Bot</b>\n\n` +
-        `⏱ Uptime: ${formatUptime(state.stats.botStartTime)}\n` +
-        `📰 Berita terkirim  : ${state.stats.newsSentCount}\n` +
-        `📡 Webhook hits     : ${state.stats.webhookHitCount}\n` +
-        `🪐 Mooner alerts    : ${state.stats.moonerAlertCount}\n` +
-        `🔄 Polling          : ${state.isPollingActive ? 'Aktif ▶️' : 'Pause ⏸️'}\n` +
-        `💾 Cache (berita)   : ${state.cacheSize()} artikel\n` +
-        `📢 Channel          : ${CONFIG.TELEGRAM_CHANNEL_ID}`
+        `${f.header('BOT STATUS')}\n` +
+        `${f.sep()}\n` +
+        `${f.row('Uptime', up)}\n` +
+        `${f.row('Polling', state.isPollingActive ? 'active' : 'paused')}\n` +
+        `${f.row('Sol price', `$${state.currentSolPrice.toFixed(2)}`)}\n` +
+        `${f.sep()}\n` +
+        `${f.row('News sent', state.stats.newsSentCount)}\n` +
+        `${f.row('Webhook hits', state.stats.webhookHitCount)}\n` +
+        `${f.row('Signal alerts', state.stats.moonerAlertCount)}\n` +
+        `${f.row('Cache size', `${state.cacheSize()} articles`)}\n` +
+        `${f.row('Tracked tokens', state.trackedTokens.size)}\n` +
+        `${f.sep()}\n` +
+        `${f.row('Channel', CONFIG.TELEGRAM_CHANNEL_ID, true)}`
     );
 }
 
@@ -46,84 +53,126 @@ function registerHandlers(bot) {
         return next();
     });
 
-    // ─── Public Commands ──────────────────────────────────────
+    // ─── /start ──────────────────────────────────────────────
     bot.command('start', ctx => ctx.reply(
-        '👋 <b>Crypto Radar Bot</b>\n\n' +
-        '📰 Auto-polling berita crypto\n' +
-        '🪐 Pump.fun Mooner Radar\n' +
-        '💎 Solana webhook monitor\n\n' +
-        'Ketik /help untuk daftar perintah.',
+        `${f.header('CRYPTO RADAR BOT')}\n` +
+        `${f.sep()}\n` +
+        `${f.row('News polling', 'auto, crypto headlines')}\n` +
+        `${f.row('Pump radar', 'pump.fun early signal')}\n` +
+        `${f.row('Trading', 'auto-buy / stop-loss / trailing')}\n` +
+        `${f.row('Solana', 'webhook monitor')}\n\n` +
+        `Type <code>/help</code> for command list.`,
         { parse_mode: 'HTML' }
     ));
 
-    bot.command('help', ctx => ctx.reply(
-        '<b>📋 Perintah Tersedia:</b>\n\n' +
-        '/start   — Sambutan\n' +
-        '/help    — Bantuan ini\n' +
-        '/test    — Test kirim ke channel\n' +
-        '/status  — Status bot\n' +
-        '/wallet  — Info wallet & saldo SOL\n' +
-        '/trading_status — Status trading aktif' +
-        (isAdmin(ctx) ? '\n\n<b>🔑 Admin:</b>\n/pause /resume /forcenews /broadcast &lt;pesan&gt;' : ''),
-        { parse_mode: 'HTML' }
-    ));
+    // ─── /help ───────────────────────────────────────────────
+    bot.command('help', ctx => {
+        const adminSection = isAdmin(ctx)
+            ? `\n${f.sep()}\n` +
+              `<b>Admin commands</b>\n` +
+              `<code>/pause</code>             pause news polling\n` +
+              `<code>/resume</code>            resume news polling\n` +
+              `<code>/forcenews</code>         force news check now\n` +
+              `<code>/broadcast</code> msg     send raw message to channel\n` +
+              `<code>/reset_daily</code>       reset daily trade stats\n` +
+              `<code>/clear_sim</code>         remove all simulation positions\n` +
+              `<code>/close_all</code>         emergency close all positions\n` +
+              `<code>/close</code> mint        close single position\n` +
+              `<code>/risk_set</code> key val  update risk parameter\n` +
+              `<code>/whitelist_add</code> m   add mint to whitelist\n` +
+              `<code>/whitelist_remove</code>  remove mint from whitelist\n` +
+              `<code>/dca_create</code>        create DCA plan\n` +
+              `<code>/dca_cancel</code> id     cancel DCA plan\n` +
+              `<code>/grid_create</code>       create grid plan\n` +
+              `<code>/grid_cancel</code> id    cancel grid plan`
+            : '';
 
+        return ctx.reply(
+            `${f.header('COMMAND LIST')}\n` +
+            `${f.sep()}\n` +
+            `<code>/start</code>              welcome info\n` +
+            `<code>/help</code>               this message\n` +
+            `<code>/status</code>             bot status\n` +
+            `<code>/wallet</code>             wallet address & SOL balance\n` +
+            `<code>/trading_status</code>     open positions & daily stats\n` +
+            `<code>/risk_config</code>        view risk parameters\n` +
+            `<code>/alert_config</code>       view notification flags\n` +
+            `<code>/test</code>               send test message to channel` +
+            adminSection,
+            { parse_mode: 'HTML' }
+        );
+    });
+
+    // ─── /test ───────────────────────────────────────────────
     bot.command('test', async ctx => {
-        const res = await sendToChannel('✅ <b>Test berhasil!</b> Bot aktif dan terhubung ke channel.');
+        const res = await sendToChannel(
+            `${f.header('TEST MESSAGE')}\n` +
+            `${f.sep()}\n` +
+            `Connection OK.`
+        );
         return res
-            ? ctx.reply(`✅ Pesan test dikirim. (ID: ${res.message_id})`)
-            : ctx.reply('❌ Gagal! Periksa log di terminal.');
+            ? ctx.reply(`Test sent. Message ID: ${res.message_id}`)
+            : ctx.reply('Failed. Check terminal log.');
     });
 
+    // ─── /debug ──────────────────────────────────────────────
     bot.command('debug', async ctx => {
-        ctx.reply('🔍 Mengirim pesan debug ke channel...');
-        const res = await sendToChannel('<b>DEBUG:</b> Pesan tes dari /debug.');
+        ctx.reply('Sending debug message to channel...');
+        const res = await sendToChannel(
+            `${f.header('DEBUG')}\n` +
+            `${f.sep()}\n` +
+            `Triggered by: <code>/debug</code>`
+        );
         return res
-            ? ctx.reply(`✅ Berhasil. Pesan ID: ${res.message_id}`)
-            : ctx.reply('❌ Gagal! Lihat log terminal.');
+            ? ctx.reply(`Done. Message ID: ${res.message_id}`)
+            : ctx.reply('Failed. Check terminal log.');
     });
 
+    // ─── /status ─────────────────────────────────────────────
     bot.command('status', async ctx => {
         return ctx.reply(buildStatusMessage(), { parse_mode: 'HTML' });
     });
 
-    // ─── Admin Commands ───────────────────────────────────────
-    bot.command('pause',  requireAdmin, ctx => {
+    // ─── Admin: pause / resume / forcenews / broadcast ───────
+    bot.command('pause', requireAdmin, ctx => {
         state.pausePolling();
-        return ctx.reply('⏸️ Polling dihentikan.');
+        return ctx.reply('News polling paused.');
     });
 
     bot.command('resume', requireAdmin, ctx => {
         state.resumePolling();
-        return ctx.reply('▶️ Polling dilanjutkan.');
+        return ctx.reply('News polling resumed.');
     });
 
     bot.command('forcenews', requireAdmin, async ctx => {
-        await ctx.reply('🔄 Memaksa cek berita...');
+        await ctx.reply('Forcing news check...');
         await fetchCryptoNews();
-        return ctx.reply('✅ Selesai.');
+        return ctx.reply('Done.');
     });
 
     bot.command('broadcast', requireAdmin, async ctx => {
         const text = ctx.message.text.replace('/broadcast', '').trim();
-        if (!text) return ctx.reply('⚠️ Penggunaan: /broadcast <pesan>');
+        if (!text) return ctx.reply('Usage: /broadcast <message>');
         try {
             await bot.telegram.sendMessage(CONFIG.TELEGRAM_CHANNEL_ID, text);
-            return ctx.reply('✅ Pesan disiarkan ke channel.');
+            return ctx.reply('Broadcast sent.');
         } catch (err) {
-            return ctx.reply(`❌ Gagal: ${err.message}`);
+            return ctx.reply(`Failed: ${err.message}`);
         }
     });
 
-    log.ok('Main command handlers terdaftar');
+    log.ok('Main command handlers registered');
 }
 
+// ============================================================
+// FALLBACK
+// ============================================================
 function registerFallbackHandler(bot) {
     bot.on('text', ctx => {
         if (ctx.message.text.startsWith('/'))
-            return ctx.reply('❓ Perintah tidak dikenal. Ketik /help.');
+            return ctx.reply('Unknown command. Type /help.');
     });
-    log.ok('Fallback handler terdaftar');
+    log.ok('Fallback handler registered');
 }
 
 module.exports = { registerHandlers, registerFallbackHandler, isAdmin, requireAdmin };

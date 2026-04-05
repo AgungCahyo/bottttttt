@@ -5,6 +5,7 @@ const { Markup } = require('telegraf');
 const CONFIG  = require('../config');
 const state   = require('../config/state');
 const scorer  = require('../trading/signalScorer');
+const f       = require('../utils/tgFormat');
 const { sendToChannel } = require('./telegram');
 const tradingEngine = require('../trading/tradingEngine');
 const log = require('../utils/logger');
@@ -165,12 +166,11 @@ async function handleTrade(event) {
         token.alertMCapSol = mcapSol;
         state.stats.moonerAlertCount++;
 
-        // ── Kirim ke channel HANYA jika flag aktif ──────────────
         if (CONFIG.ENABLE_SIGNAL_ALERTS) {
             const message  = formatEarlySignalWithScore(event.mint, token, mcapSol, curve, scoreResult);
             const keyboard = Markup.inlineKeyboard([
-                [Markup.button.url('Beli di Axiom', `https://axiom.trade/t/${event.mint}`)],
-                [Markup.button.url('Analisa di Photon', `https://photon-sol.tinyastro.io/en/lp/${event.mint}`)],
+                [Markup.button.url('axiom.trade', `https://axiom.trade/t/${event.mint}`)],
+                [Markup.button.url('photon', `https://photon-sol.tinyastro.io/en/lp/${event.mint}`)],
             ]);
             await sendToChannel(message, keyboard);
         }
@@ -186,7 +186,7 @@ async function handleTrade(event) {
             log.skip(`${scoreTag} ${token.symbol} — ${why}`);
         }
 
-        return; // tidak perlu cek call confirmed pada tick yang sama
+        return;
     }
 
     // ─── CALL CONFIRMED (profit milestone) ────────────────────
@@ -197,29 +197,27 @@ async function handleTrade(event) {
         if (wholeMultiplier >= 2 && !token.milestones.has(wholeMultiplier)) {
             token.milestones.add(wholeMultiplier);
 
-            // ── Kirim hanya jika flag sinyal aktif ─────────────
             if (CONFIG.ENABLE_SIGNAL_ALERTS) {
-                const { esc } = require('../utils/helpers');
                 const solPrice    = state.currentSolPrice;
                 const percent     = ((multiplier - 1) * 100).toFixed(0);
-                const currentUsdM = (mcapSol * solPrice).toLocaleString(undefined, { maximumFractionDigits: 0 });
-                const alertUsdM   = (token.alertMCapSol * solPrice).toLocaleString(undefined, { maximumFractionDigits: 0 });
+                const currentUsdM = (mcapSol * solPrice).toLocaleString('en-US', { maximumFractionDigits: 0 });
+                const alertUsdM   = (token.alertMCapSol * solPrice).toLocaleString('en-US', { maximumFractionDigits: 0 });
 
                 const msg =
-                    `🔥 <b>${wholeMultiplier}x CALL CONFIRMED (+${percent}%)</b>\n` +
-                    `━━━━━━━━━━━━━━━━━━━━━\n` +
-                    `🚀 <b>${esc(token.name)} ($${esc(token.symbol)})</b>\n\n` +
-                    `<b>Gain:</b> +${percent}% since alert (${multiplier.toFixed(1)}x)\n` +
-                    `<b>MCap now:</b> $${currentUsdM}\n` +
-                    `<b>MCap at alert:</b> $${alertUsdM}\n` +
-                    `<b>Curve:</b> ${curve}% | <b>Volume:</b> ${token.volumeSol.toFixed(1)} SOL\n\n` +
-                    `📍 <b>CA:</b> <code>${event.mint}</code>\n` +
-                    `━━━━━━━━━━━━━━━━━━━━━\n` +
-                    `<a href="https://pump.fun/${event.mint}">pump.fun</a> | <a href="https://solscan.io/token/${event.mint}">Solscan</a>`;
+                    `${f.header(`CALL CONFIRMED  ${wholeMultiplier}x  +${percent}%`)}\n` +
+                    `${f.sep()}\n` +
+                    `<b>${f.esc(token.name)}</b>  <code>$${f.esc(token.symbol)}</code>\n\n` +
+                    `${f.row('Gain', `+${percent}%  (${multiplier.toFixed(1)}x from alert)`)}\n` +
+                    `${f.row('MCap now', `$${currentUsdM}`)}\n` +
+                    `${f.row('MCap at alert', `$${alertUsdM}`)}\n` +
+                    `${f.row('Curve', `${curve}%  |  Volume  ${token.volumeSol.toFixed(1)} SOL`)}\n\n` +
+                    `${f.row('CA', event.mint, true)}\n` +
+                    `${f.sep()}\n` +
+                    `${f.tokenLink(event.mint)}`;
 
                 const keyboard = Markup.inlineKeyboard([
-                    [Markup.button.url('💰 Take Profit (Axiom)', `https://axiom.trade/t/${event.mint}`)],
-                    [Markup.button.url('🔭 Photon', `https://photon-sol.tinyastro.io/en/lp/${event.mint}`)],
+                    [Markup.button.url('take profit  (axiom)', `https://axiom.trade/t/${event.mint}`)],
+                    [Markup.button.url('photon', `https://photon-sol.tinyastro.io/en/lp/${event.mint}`)],
                 ]);
                 await sendToChannel(msg, keyboard);
             }
@@ -230,46 +228,55 @@ async function handleTrade(event) {
 }
 
 // ============================================================
-// FORMAT EARLY SIGNAL + SKOR
+// FORMAT EARLY SIGNAL + SCORE
 // ============================================================
 function formatEarlySignalWithScore(mint, data, mcapSol, curve, scoreResult) {
-    const { esc } = require('../utils/helpers');
     const solPrice  = state.currentSolPrice;
-    const usdMCap   = (mcapSol * solPrice).toLocaleString(undefined, { maximumFractionDigits: 0 });
-    const usdVolume = (data.volumeSol * solPrice).toLocaleString(undefined, { maximumFractionDigits: 0 });
+    const usdMCap   = (mcapSol * solPrice).toLocaleString('en-US', { maximumFractionDigits: 0 });
+    const usdVolume = (data.volumeSol * solPrice).toLocaleString('en-US', { maximumFractionDigits: 0 });
 
-    const filled  = Math.round(scoreResult.score / 10);
-    const empty   = 10 - filled;
-    const bar     = '█'.repeat(filled) + '░'.repeat(empty);
+    // Score bar: 10 chars
+    const filled = Math.round(scoreResult.score / 10);
+    const bar    = '#'.repeat(filled) + '-'.repeat(10 - filled);
 
-    const rating  = scoreResult.score >= 75 ? '🔥 STRONG'  :
-                    scoreResult.score >= 55 ? '✅ GOOD'     :
-                    scoreResult.score >= 35 ? '⚠️ WEAK'    : '❌ POOR';
+    const rating =
+        scoreResult.score >= 75 ? 'STRONG' :
+        scoreResult.score >= 55 ? 'GOOD'   :
+        scoreResult.score >= 35 ? 'WEAK'   : 'POOR';
+
+    // Flags
+    const flags = [];
+    if (data.isDevSold)                      flags.push('DEV SOLD');
+    if (data.isBundled)                      flags.push('BUNDLED LAUNCH');
+    if (data.whales > 3)                     flags.push('WHALE CLUSTER');
+    if (parseFloat(scoreResult.velocity) > 20) flags.push('SPEED RUNNER');
 
     const rejectLine = scoreResult.rejects.length > 0
-        ? `‼️ REJECT: ${scoreResult.rejects.join(' | ')}\n\n`
+        ? `${f.row('REJECT', scoreResult.rejects.join(' | '))}\n\n`
         : '';
 
     const autoBuyLine = scoreResult.shouldBuy
-        ? `🤖 <b>AUTO-BUY TRIGGERED</b>\n\n`
-        : `🚫 <i>Auto-buy dilewati (skor terlalu rendah)</i>\n\n`;
+        ? `${f.row('Auto-buy', 'TRIGGERED')}\n\n`
+        : `${f.row('Auto-buy', `skipped  (min score ${scoreResult.minScore})`)}\n\n`;
 
     return (
-        `⚡ <b>EARLY SIGNAL</b>\n` +
-        `━━━━━━━━━━━━━━━━━━━━━\n` +
-        `<b>${esc(data.name)} ($${esc(data.symbol)})</b>\n\n` +
+        `${f.header('EARLY SIGNAL')}\n` +
+        `${f.sep()}\n` +
+        `<b>${f.esc(data.name)}</b>  <code>$${f.esc(data.symbol)}</code>\n\n` +
         rejectLine +
-        `<b>Score:</b> <code>${bar}</code> ${scoreResult.score}/100 ${rating}\n` +
+        (flags.length > 0 ? `${f.row('Flags', flags.join('  |  '))}\n\n` : '') +
+        `${f.row('Score', `<code>${bar}</code>  ${scoreResult.score}/100  ${rating}`)}\n\n` +
         autoBuyLine +
-        `<b>MCap:</b> $${usdMCap} | <b>Curve:</b> ${curve}%\n` +
-        `<b>Volume:</b> <code>${data.volumeSol.toFixed(1)} SOL</code> (~$${usdVolume})\n` +
-        `<b>Buyers:</b> ${data.buyers.size} | <b>B/S:</b> ${data.buys}/${data.sells}\n` +
-        `<b>Velocity:</b> ${scoreResult.velocity} buys/min\n` +
-        `<b>Whales:</b> ${data.whales} (max ${data.maxWhaleBuy.toFixed(1)} SOL)\n` +
-        `<b>Dev:</b> ${data.isDevSold ? 'SOLD ❌' : 'Holding ✅'} | <b>Bundled:</b> ${data.isBundled ? 'Yes ⚠️' : 'No ✅'}\n\n` +
-        `📍 <b>CA:</b> <code>${mint}</code>\n` +
-        `━━━━━━━━━━━━━━━━━━━━━\n` +
-        `<a href="https://pump.fun/${mint}">pump.fun</a> | <a href="https://solscan.io/token/${mint}">Solscan</a>`
+        `${f.row('MCap', `$${usdMCap}  |  Curve  ${curve}%`)}\n` +
+        `${f.row('Volume', `${data.volumeSol.toFixed(1)} SOL  (~$${usdVolume})`)}\n` +
+        `${f.row('Buyers', `${data.buyers.size}  |  B/S  ${data.buys}/${data.sells}`)}\n` +
+        `${f.row('Velocity', `${scoreResult.velocity} buys/min`)}\n` +
+        `${f.row('Whales', `${data.whales}  (max ${data.maxWhaleBuy.toFixed(1)} SOL)`)}\n` +
+        `${f.row('Dev', data.isDevSold ? 'SOLD' : 'Holding')}\n` +
+        `${f.row('Bundled', data.isBundled ? 'Yes' : 'No')}\n\n` +
+        `${f.row('CA', mint, true)}\n` +
+        `${f.sep()}\n` +
+        `${f.tokenLink(mint)}`
     );
 }
 
@@ -277,17 +284,17 @@ function formatEarlySignalWithScore(mint, data, mcapSol, curve, scoreResult) {
 // WEBSOCKET INIT
 // ============================================================
 function initPumpRadar() {
-    log.radar('Menghubungkan ke Pump.fun WebSocket…');
+    log.radar('Connecting to Pump.fun WebSocket...');
     const ws = new WebSocket(WS_URL);
     activeWs = ws;
 
     ws.on('open', () => {
-        log.ok('Radar Pump.fun terhubung');
+        log.ok('Pump.fun radar connected');
         ws.send(JSON.stringify({ method: 'subscribeNewToken' }));
 
         const openMints = tradingEngine.posTracker.getAllPositions().map(p => p.mint);
         if (openMints.length > 0) {
-            log.radar(`Re-subscribe ${openMints.length} posisi terbuka`);
+            log.radar(`Re-subscribing ${openMints.length} open position(s)`);
             ws.send(JSON.stringify({ method: 'subscribeTokenTrade', keys: openMints }));
         }
     });
@@ -305,7 +312,7 @@ function initPumpRadar() {
 
     ws.on('close', () => {
         activeWs = null;
-        log.radarWarn('Radar terputus — reconnect ~5s');
+        log.radarWarn('Radar disconnected — reconnecting in 5s');
         setTimeout(initPumpRadar, 5_000);
     });
 

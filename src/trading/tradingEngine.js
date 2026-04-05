@@ -7,6 +7,7 @@ const scorer       = require('./signalScorer');
 const dca          = require('./strategies/dca');
 const grid         = require('./strategies/grid');
 const { sendToChannel } = require('../services/telegram');
+const f                 = require('../utils/tgFormat');
 const { esc, sleep }    = require('../utils/helpers');
 const log               = require('../utils/logger');
 
@@ -99,16 +100,16 @@ function init({ rpcUrl, privateKeyBase58 }) {
             restored++;
         }
     }
-    if (restored > 0) log.info(`Trailing stop restored: ${restored} posisi`);
+    if (restored > 0) log.info(`Trailing stop restored: ${restored} position(s)`);
 
     const allPos = posTracker.getAllPositions();
-    log.info(`Posisi aktif: ${allPos.length} | mode: ${isSimMode ? 'SIMULASI' : 'REAL TRADING'}`);
+    log.info(`Open positions: ${allPos.length}  |  mode: ${isSimMode ? 'SIMULATION' : 'LIVE'}`);
 
     setInterval(dcaTick, DCA_TICK_INTERVAL_MS);
     setInterval(priceMonitorTick, PRICE_CHECK_INTERVAL_MS);
 
     initialized = true;
-    log.engine(`Aktif — wallet: ${walletAddress}`);
+    log.engine(`Active — wallet: ${walletAddress}`);
 
     posTracker.on('opened', (pos) => {
         try {
@@ -132,7 +133,7 @@ function init({ rpcUrl, privateKeyBase58 }) {
 function _cleanupSimPositions() {
     const simPos = posTracker.getAllPositions().filter(p => p.isSimulation);
     if (simPos.length === 0) return;
-    log.clean(`Membersihkan ${simPos.length} posisi simulasi (mode REAL)…`);
+    log.clean(`Removing ${simPos.length} simulation position(s) (LIVE mode)...`);
     for (const pos of simPos) {
         posTracker.closePosition(pos.mint, { exitPriceSol: pos.entryPriceSol, reason: 'cleanup_sim' });
         trailingStop.removeTrail(pos.mint);
@@ -149,7 +150,7 @@ function _cleanupStalePositions() {
             cleaned++;
         }
     }
-    if (cleaned > 0) log.clean(`${cleaned} posisi simulasi kadaluarsa dibersihkan`);
+    if (cleaned > 0) log.clean(`${cleaned} stale simulation position(s) removed`);
 }
 
 // ============================================================
@@ -176,7 +177,7 @@ async function handleStreamPrice(mint, currentPrice) {
 
         if (pos.stopLossPriceSol && buf.length >= minSamples && avg != null && avg <= pos.stopLossPriceSol) {
             if (stopLossInflight.has(mint)) return;
-            log.stream(`SL (avg ${avg.toFixed(8)} ≤ SL) ${pos.symbol}`);
+            log.stream(`SL (avg ${avg.toFixed(8)} <= SL) ${pos.symbol}`);
             await executeStopLossClose(pos, avg);
             return;
         }
@@ -185,7 +186,7 @@ async function handleStreamPrice(mint, currentPrice) {
 
         const action = trailingStop.update(mint, currentPrice);
         if (action) {
-            log.stream(`Trail: ${pos.symbol} → ${action.action}`);
+            log.stream(`Trail: ${pos.symbol} -> ${action.action}`);
             await handleTrailAction(pos, action, currentPrice);
         }
     } catch { /* fail silently in stream */ }
@@ -241,6 +242,8 @@ async function executeStopLossClose(pos, currentPriceSol) {
 
     const prioMicro = priorityMicroForPos(pos);
     const isSim     = pos.isSimulation || CONFIG.ENABLE_SIMULATION_MODE;
+    const simTag    = isSim ? '  [ SIM ]' : '';
+
     try {
         const balance = await pump.getBalance(mint);
         if (!balance || balance <= 0) {
@@ -255,24 +258,29 @@ async function executeStopLossClose(pos, currentPriceSol) {
         posTracker.closePosition(mint, { exitPriceSol: currentPriceSol, reason: 'stop_loss', txid: result.txid });
         riskManager.recordTrade({ pnlSol });
 
-        // ── Kirim hanya jika flag aktif ──────────────────────
         if (CONFIG.ENABLE_STOPLOSS_ALERTS) {
             await sendToChannel(
-                `🛑 <b>STOP LOSS</b>${isSim ? ' <b>(SIM)</b>' : ''}\n` +
-                `🪙 ${esc(pos.symbol)}\n` +
-                `📉 Harga: <code>${currentPriceSol.toFixed(8)}</code> ≤ SL\n` +
-                `📊 PnL: ${pnlSol >= 0 ? '+' : ''}${pnlSol.toFixed(4)} SOL\n` +
-                `🔗 <a href="https://solscan.io/tx/${result.txid}">Solscan</a>`
+                `${f.header('STOP LOSS' + simTag)}\n` +
+                `${f.sep()}\n` +
+                `${f.row('Token', esc(pos.symbol))}\n` +
+                `${f.row('Price', currentPriceSol.toFixed(8), true)}\n` +
+                `${f.row('SL level', pos.stopLossPriceSol?.toFixed(8), true)}\n` +
+                `${f.row('PnL', `${f.signed(pnlSol)} SOL`)}\n` +
+                `${f.sep()}\n` +
+                `${f.txLink(result.txid)}`
             ).catch(() => {});
         }
 
-        log.stopLoss(`${pos.symbol} | PnL ${pnlSol.toFixed(4)} SOL`);
+        log.stopLoss(`${pos.symbol}  |  PnL ${pnlSol.toFixed(4)} SOL`);
     } catch (e) {
         const msg = e?.message || String(e);
-        log.err(`Stop loss gagal [${pos.symbol}]: ${msg}`);
+        log.err(`Stop loss failed [${pos.symbol}]: ${msg}`);
         if (CONFIG.ENABLE_STOPLOSS_ALERTS) {
             await sendToChannel(
-                `⚠️ <b>STOP LOSS GAGAL</b>\n🪙 ${esc(pos.symbol)}\n❗ ${esc(msg.slice(0, 120))}`
+                `${f.header('STOP LOSS FAILED')}\n` +
+                `${f.sep()}\n` +
+                `${f.row('Token', esc(pos.symbol))}\n` +
+                `${f.row('Error', msg.slice(0, 120))}`
             ).catch(() => {});
         }
     } finally {
@@ -322,7 +330,7 @@ async function handleTrailAction(pos, action, currentPriceSol) {
 
         const pnlSol = (currentPriceSol - pos.entryPriceSol) * sellTokens;
         const pnlPct = ((currentPriceSol / pos.entryPriceSol) - 1) * 100;
-        const simTag = (pos.isSimulation || CONFIG.ENABLE_SIMULATION_MODE) ? ' <b>(SIM)</b>' : '';
+        const simTag = (pos.isSimulation || CONFIG.ENABLE_SIMULATION_MODE) ? '  [ SIM ]' : '';
 
         if (action.remaining > 0.02) {
             const newBal = await pump.getBalance(pos.mint);
@@ -335,27 +343,26 @@ async function handleTrailAction(pos, action, currentPriceSol) {
             riskManager.recordTrade({ pnlSol });
         }
 
-        // ── Kirim notif profit/trail hanya jika flag aktif ───
         if (CONFIG.ENABLE_PROFIT_ALERTS) {
-            const emoji = action.action === 'PARTIAL_SELL' ? '🎯' :
-                          action.action === 'TRAIL_STOP'   ? '📉' : '⚖️';
-
             const sellLabel = action.action === 'PARTIAL_SELL'
-                ? `${(action.sellPct * 100).toFixed(0)}% dari ukuran entry awal`
-                : 'seluruh sisa token';
+                ? `${(action.sellPct * 100).toFixed(0)}% of initial`
+                : 'remaining';
+
+            const statusLine = action.remaining > 0.02
+                ? `${f.row('Remaining', `${(action.remaining * 100).toFixed(0)}% (trailing)`)}\n`
+                : `${f.row('Status', 'POSITION CLOSED')}\n`;
 
             await sendToChannel(
-                `${emoji} <b>${action.phase}</b>${simTag}\n` +
-                `━━━━━━━━━━━━━━━━━━━━━\n` +
-                `🪙 <b>${esc(pos.symbol)}</b>\n` +
-                `📊 <b>${action.multiplier}x</b> dari entry\n` +
-                `💰 Dijual: ${sellLabel}\n` +
-                `📈 PnL batch: ${pnlSol >= 0 ? '+' : ''}${pnlSol.toFixed(4)} SOL (${pnlPct.toFixed(1)}%)\n` +
-                (action.remaining > 0.02
-                    ? `📦 Sisa: ${(action.remaining * 100).toFixed(0)}% dari entry awal (trailing)\n`
-                    : `✅ Posisi DITUTUP PENUH\n`) +
-                (action.stopPrice ? `🛑 Trail stop: ${action.stopPrice.toFixed(8)} SOL\n` : '') +
-                `🔗 <a href="https://solscan.io/tx/${result.txid}">Solscan</a>`
+                `${f.header(action.phase + simTag)}\n` +
+                `${f.sep()}\n` +
+                `${f.row('Token', esc(pos.symbol))}\n` +
+                `${f.row('Multiplier', `${action.multiplier}x from entry`)}\n` +
+                `${f.row('Sold', sellLabel)}\n` +
+                `${f.row('PnL batch', `${f.signed(pnlSol)} SOL  (${pnlPct.toFixed(1)}%)`)}\n` +
+                statusLine +
+                (action.stopPrice ? `${f.row('Trail stop', action.stopPrice.toFixed(8), true)}\n` : '') +
+                `${f.sep()}\n` +
+                `${f.txLink(result.txid)}`
             );
         }
 
@@ -363,12 +370,15 @@ async function handleTrailAction(pos, action, currentPriceSol) {
 
     } catch (rawError) {
         const errorMsg = rawError?.message || rawError?.toString?.() || 'Trail action failed';
-        log.err(`Trail action gagal [${pos.symbol}]: ${errorMsg}`);
+        log.err(`Trail action failed [${pos.symbol}]: ${errorMsg}`);
         if (!errorMsg.includes('GRADUATED') && !errorMsg.includes('0')) {
             const CONFIG = require('../config');
             if (CONFIG.ENABLE_PROFIT_ALERTS) {
                 await sendToChannel(
-                    `⚠️ <b>TRAIL FAILED</b>\n🪙 ${esc(pos.symbol)}\n❗ ${errorMsg.slice(0, 100)}`
+                    `${f.header('TRAIL FAILED')}\n` +
+                    `${f.sep()}\n` +
+                    `${f.row('Token', esc(pos.symbol))}\n` +
+                    `${f.row('Error', errorMsg.slice(0, 100))}`
                 ).catch(() => {});
             }
         }
@@ -384,7 +394,7 @@ async function executeAutoBuy(mint, symbol, token, scoreResult) {
     if (buyLockSet.has(mint))           return null;
     if (posTracker.hasPosition(mint))   return null;
     if (posTracker.getPositionCount() >= MAX_POSITIONS) {
-        log.warn(`Max posisi (${MAX_POSITIONS}), skip ${symbol}`);
+        log.warn(`Max positions (${MAX_POSITIONS}), skipping ${symbol}`);
         return null;
     }
 
@@ -406,7 +416,7 @@ async function executeAutoBuy(mint, symbol, token, scoreResult) {
             const solBal = await pump.getSolBalance();
             const needed = amountSol + CONFIG.MIN_SOL_BUFFER_SOL;
             if (solBal < needed) {
-                log.warn(`SOL kurang: ${solBal.toFixed(4)} < ${needed.toFixed(4)}`);
+                log.warn(`Insufficient SOL: ${solBal.toFixed(4)} < ${needed.toFixed(4)}`);
                 buyLockSet.delete(mint);
                 return null;
             }
@@ -417,8 +427,8 @@ async function executeAutoBuy(mint, symbol, token, scoreResult) {
         }
     }
 
-    const modeTag = CONFIG.ENABLE_SIMULATION_MODE ? '[SIM]' : '[REAL]';
-    log.trade(`${modeTag} AUTO-BUY: ${symbol} | score=${scoreResult.score} | ${amountSol} SOL`);
+    const modeTag = CONFIG.ENABLE_SIMULATION_MODE ? '[SIM]' : '[LIVE]';
+    log.trade(`${modeTag} AUTO-BUY: ${symbol}  score=${scoreResult.score}  ${amountSol} SOL`);
 
     let result;
     try {
@@ -458,20 +468,23 @@ async function executeAutoBuy(mint, symbol, token, scoreResult) {
         trailingStop.initTrail(mint, entryPriceSol);
         riskManager.recordTrade({ pnlSol: 0 });
 
-        // ── Kirim notif buy hanya jika flag aktif ────────────
         if (CONFIG.ENABLE_BUY_ALERTS) {
-            const simTag = result.isSimulation ? ' <b>(SIMULASI)</b>' : '';
+            const simTag = result.isSimulation ? '  [ SIM ]' : '';
             await sendToChannel(
-                `🤖 <b>AUTO-BUY EXECUTED</b>${simTag}\n` +
-                `🪙 <b>${esc(symbol)}</b>\n` +
-                `🎯 Score: <b>${scoreResult.score}/100</b>\n` +
-                `💰 ${amountSol} SOL → ${result.outputAmount.toFixed(0)} tokens\n` +
-                `📍 Entry: <code>${entryPriceSol.toFixed(8)}</code> SOL\n` +
-                `🔗 <a href="https://solscan.io/tx/${result.txid.slice(0, 100)}">TX</a>`
+                `${f.header('AUTO-BUY EXECUTED' + simTag)}\n` +
+                `${f.sep()}\n` +
+                `${f.row('Token', esc(symbol))}\n` +
+                `${f.row('Score', `${scoreResult.score} / 100`)}\n` +
+                `${f.row('Spent', `${amountSol} SOL`)}\n` +
+                `${f.row('Received', `${result.outputAmount.toFixed(0)} tokens`)}\n` +
+                `${f.row('Entry price', entryPriceSol.toFixed(8), true)}\n` +
+                `${f.row('Stop loss', stopLossPriceSol.toFixed(8), true)}\n` +
+                `${f.sep()}\n` +
+                `${f.txLink(result.txid)}`
             );
         }
 
-        log.ok(`AUTO-BUY OK: ${symbol} | ${result.outputAmount.toFixed(0)} tokens`);
+        log.ok(`AUTO-BUY OK: ${symbol}  |  ${result.outputAmount.toFixed(0)} tokens`);
         return result;
 
     } catch (rawError) {
@@ -492,16 +505,18 @@ async function executeAutoBuy(mint, symbol, token, scoreResult) {
         if (errorMsg.includes('GRADUATED')) { log.info(`Skip [${symbol}]: graduated`); return null; }
         if (errorMsg.includes('Token tidak terdeteksi')) { log.info(`Skip [${symbol}]: RPC delay`); return null; }
 
-        log.err(`Auto-buy gagal [${symbol}]: ${errorMsg}`);
+        log.err(`Auto-buy failed [${symbol}]: ${errorMsg}`);
         if (errorLogs.length > 0) log.txLogs(errorLogs.join('\n'));
 
         if (!errorMsg.includes('Max posisi') && !errorMsg.includes('Risk rejected')) {
             if (CONFIG.ENABLE_BUY_ALERTS) {
                 await sendToChannel(
-                    `❌ <b>AUTO-BUY FAILED</b>\n` +
-                    `🪙 ${esc(symbol)} | Score ${scoreResult.score}\n` +
-                    `⚠️ ${esc(errorMsg.slice(0, 100))}${errorMsg.length > 100 ? '...' : ''}\n` +
-                    `<i>${errorCode}</i>`
+                    `${f.header('AUTO-BUY FAILED')}\n` +
+                    `${f.sep()}\n` +
+                    `${f.row('Token', esc(symbol))}\n` +
+                    `${f.row('Score', scoreResult.score)}\n` +
+                    `${f.row('Error', errorMsg.slice(0, 120))}\n` +
+                    `${f.row('Code', errorCode)}`
                 ).catch(() => {});
             }
         }
@@ -515,7 +530,7 @@ async function executeAutoBuy(mint, symbol, token, scoreResult) {
 async function manualClose(mint) {
     const CONFIG = require('../config');
     const pos    = posTracker.getPosition(mint);
-    if (!pos) throw new Error('Posisi tidak ditemukan');
+    if (!pos) throw new Error('Position not found');
 
     const balance = await pump.getBalance(mint);
     if (balance <= 0) {

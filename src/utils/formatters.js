@@ -1,5 +1,7 @@
 'use strict';
-const { esc } = require('../utils/helpers');
+
+const { esc } = require('./helpers');
+const f = require('./tgFormat');
 
 // ============================================================
 // NEWS FORMATTER
@@ -11,14 +13,17 @@ function formatNews(article) {
     const keywords = Array.isArray(article.keywords) && article.keywords.length > 0
         ? article.keywords.slice(0, 4).map(k => `#${k.replace(/\s+/g, '')}`).join(' ')
         : '#Crypto #News';
-    const linkPart = url ? `\n🔗 <a href="${esc(url)}">Baca Selengkapnya</a>` : '';
+    const linkPart = url
+        ? `\n<a href="${esc(url)}">Baca selengkapnya</a>`
+        : '';
 
     return (
-        `🔥 <b>NEWS UPDATE</b>\n\n` +
+        `${f.header('NEWS UPDATE')}\n` +
+        `${f.sep()}\n` +
         `<b>${esc(title)}</b>\n\n` +
-        `🌐 Sumber: ${esc(source)}` +
+        `${f.row('Sumber', source)}` +
         linkPart + `\n\n` +
-        `${keywords} #Blockchain`
+        `<i>${keywords} #Blockchain</i>`
     );
 }
 
@@ -28,55 +33,54 @@ function formatNews(article) {
 function formatSolanaWebhook(tx) {
     const { signature = 'N/A', type = 'UNKNOWN', source = 'N/A', description = 'Aktivitas baru di Solana.' } = tx;
     return (
-        `💎 <b>SOLANA REAL-TIME MONITOR</b>\n\n` +
-        `📦 <b>Activity:</b> <code>${type}</code>\n` +
-        `⚡ <b>Source:</b> <code>${source}</code>\n\n` +
-        `📝 <b>Info:</b>\n<i>${description}</i>\n\n` +
-        `🔗 <a href="https://solscan.io/tx/${signature}">View on Solscan</a>`
+        `${f.header('SOLANA MONITOR')}\n` +
+        `${f.sep()}\n` +
+        `${f.row('Activity', type, true)}\n` +
+        `${f.row('Source', source, true)}\n\n` +
+        `<i>${esc(description)}</i>\n\n` +
+        `${f.txLink(signature)}`
     );
 }
 
 // ============================================================
-// PUMP.FUN EARLY SIGNAL FORMATTER
+// PUMP.FUN EARLY SIGNAL FORMATTER (legacy — tanpa skor)
 // ============================================================
 function formatEarlySignal(mint, data, mcapSol, curve, solPrice) {
-    const timeElapsedSec = Math.floor((Date.now() - data.startTime) / 1000) || 1;
+    const timeElapsedSec = Math.max(Math.floor((Date.now() - data.startTime) / 1000), 1);
     const velocity  = (data.buys / (timeElapsedSec / 60)).toFixed(1);
-    const usdMCap   = (mcapSol * solPrice).toLocaleString(undefined, { maximumFractionDigits: 0 });
-    const usdVolume = (data.volumeSol * solPrice).toLocaleString(undefined, { maximumFractionDigits: 0 });
+    const usdMCap   = (mcapSol  * solPrice).toLocaleString('en-US', { maximumFractionDigits: 0 });
+    const usdVolume = (data.volumeSol * solPrice).toLocaleString('en-US', { maximumFractionDigits: 0 });
 
-    // Score 0-100
     let score = 30;
-    if (data.whales > 0)             score += 20;
-    if (parseFloat(velocity) > 10)   score += 20;
-    if (data.volumeSol > 10)         score += 20;
-    if (data.isDevSold)              score -= 40;
-    if (data.isBundled)              score += 10;
+    if (data.whales > 0)           score += 20;
+    if (parseFloat(velocity) > 10) score += 20;
+    if (data.volumeSol > 10)       score += 20;
+    if (data.isDevSold)            score -= 40;
+    if (data.isBundled)            score += 10;
     score = Math.max(0, Math.min(100, score));
 
-    // Flags
     const flags = [];
-    if (parseFloat(velocity) > 20) flags.push('🚀 SPEED RUNNER');
-    if (data.isDevSold)            flags.push('‼️ DEV SOLD');
-    if (data.isBundled)            flags.push('‼️ BUNDLED LAUNCH');
-    if (data.whales > 3)           flags.push('🐳 WHALE INTEREST');
-    const flagLine = flags.length > 0 ? `${flags.join(' | ')}\n\n` : '';
+    if (parseFloat(velocity) > 20) flags.push('SPEED RUNNER');
+    if (data.isDevSold)            flags.push('DEV SOLD');
+    if (data.isBundled)            flags.push('BUNDLED LAUNCH');
+    if (data.whales > 3)           flags.push('WHALE INTEREST');
+    const flagLine = flags.length > 0 ? `<b>FLAGS</b>  ${flags.join(' | ')}\n\n` : '';
 
     return (
-        `⚡ <b>EARLY SIGNAL</b>\n` +
-        `━━━━━━━━━━━━━━━━━━━━━\n` +
-        `<b>${esc(data.name)} ($${esc(data.symbol)})</b>\n\n` +
+        `${f.header('EARLY SIGNAL')}\n` +
+        `${f.sep()}\n` +
+        `<b>${esc(data.name)}</b>  <code>$${esc(data.symbol)}</code>\n\n` +
         flagLine +
-        `<b>Score:</b> <code>${score}/100</code>\n` +
-        `<b>MCap:</b> $${usdMCap}\n` +
-        `<b>Volume:</b> <code>${data.volumeSol.toFixed(1)} SOL</code> (~$${usdVolume})\n` +
-        `<b>Buyers:</b> ${data.buyers.size} | <b>B/S:</b> ${data.buys}/${data.sells}\n` +
-        `<b>Velocity:</b> ${velocity} buys/min\n` +
-        `<b>Curve:</b> ${curve}% | <b>Whales:</b> ${data.whales} (max ${data.maxWhaleBuy.toFixed(1)} SOL)\n` +
-        `<b>Dev:</b> ${data.isDevSold ? 'Sold All ❌' : 'Active ✅'}\n\n` +
-        `📍 <b>CA:</b> <code>${mint}</code>\n` +
-        `━━━━━━━━━━━━━━━━━━━━━\n` +
-        `<a href="https://pump.fun/${mint}">pump.fun</a> | <a href="https://solscan.io/token/${mint}">Solscan</a>`
+        `${f.row('Score', `${score}/100`)}\n` +
+        `${f.row('MCap', `$${usdMCap}`)}\n` +
+        `${f.row('Volume', `${data.volumeSol.toFixed(1)} SOL  (~$${usdVolume})`)}\n` +
+        `${f.row('Buyers', `${data.buyers.size}  |  B/S  ${data.buys}/${data.sells}`)}\n` +
+        `${f.row('Velocity', `${velocity} buys/min`)}\n` +
+        `${f.row('Curve', `${curve}%  |  Whales  ${data.whales}  (max ${data.maxWhaleBuy.toFixed(1)} SOL)`)}\n` +
+        `${f.row('Dev', data.isDevSold ? 'SOLD' : 'Holding')}\n\n` +
+        `${f.row('CA', mint, true)}\n` +
+        `${f.sep()}\n` +
+        `${f.tokenLink(mint)}`
     );
 }
 
@@ -84,22 +88,22 @@ function formatEarlySignal(mint, data, mcapSol, curve, solPrice) {
 // PUMP.FUN CALL CONFIRMED FORMATTER
 // ============================================================
 function formatCallConfirmed(mint, data, currentMCapSol, multiplier, curve, solPrice) {
-    const wholeMultiplier  = Math.floor(multiplier);
-    const percent          = ((multiplier - 1) * 100).toFixed(0);
-    const currentUsdMCap   = (currentMCapSol * solPrice).toLocaleString(undefined, { maximumFractionDigits: 0 });
-    const alertUsdMCap     = (data.alertMCapSol * solPrice).toLocaleString(undefined, { maximumFractionDigits: 0 });
+    const wholeMultiplier = Math.floor(multiplier);
+    const percent         = ((multiplier - 1) * 100).toFixed(0);
+    const currentUsdMCap  = (currentMCapSol    * solPrice).toLocaleString('en-US', { maximumFractionDigits: 0 });
+    const alertUsdMCap    = (data.alertMCapSol * solPrice).toLocaleString('en-US', { maximumFractionDigits: 0 });
 
     return (
-        `🔥 <b>${wholeMultiplier}x CALL CONFIRMED (+${percent}%)</b>\n` +
-        `━━━━━━━━━━━━━━━━━━━━━\n` +
-        `🚀 <b>${esc(data.name)} ($${esc(data.symbol)})</b>\n\n` +
-        `<b>Gain:</b> +${percent}% since alert (${multiplier.toFixed(1)}x)\n` +
-        `<b>MCap now:</b> $${currentUsdMCap}\n` +
-        `<b>MCap at alert:</b> $${alertUsdMCap}\n` +
-        `<b>Curve:</b> ${curve}% | <b>Volume:</b> ${data.volumeSol.toFixed(1)} SOL\n\n` +
-        `📍 <b>CA:</b> <code>${mint}</code>\n` +
-        `━━━━━━━━━━━━━━━━━━━━━\n` +
-        `<a href="https://pump.fun/${mint}">pump.fun</a> | <a href="https://solscan.io/token/${mint}">Solscan</a>`
+        `${f.header(`CALL CONFIRMED  ${wholeMultiplier}x  +${percent}%`)}\n` +
+        `${f.sep()}\n` +
+        `<b>${esc(data.name)}</b>  <code>$${esc(data.symbol)}</code>\n\n` +
+        `${f.row('Gain', `+${percent}%  (${multiplier.toFixed(1)}x from alert)`)}\n` +
+        `${f.row('MCap now', `$${currentUsdMCap}`)}\n` +
+        `${f.row('MCap at alert', `$${alertUsdMCap}`)}\n` +
+        `${f.row('Curve', `${curve}%  |  Volume  ${data.volumeSol.toFixed(1)} SOL`)}\n\n` +
+        `${f.row('CA', mint, true)}\n` +
+        `${f.sep()}\n` +
+        `${f.tokenLink(mint)}`
     );
 }
 
