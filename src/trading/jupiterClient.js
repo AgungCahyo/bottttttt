@@ -4,6 +4,7 @@ const {
     Connection, Keypair, VersionedTransaction, PublicKey
 } = require('@solana/web3.js');
 const bs58 = require('bs58').default || require('bs58');
+const log  = require('../utils/logger');
 
 const JUPITER_API = 'https://api.jup.ag/swap/v1';
 const SOL_MINT    = 'So11111111111111111111111111111111111111112';
@@ -27,7 +28,7 @@ function init(rpcUrl, privateKeyBase58) {
         throw new Error(`Kunci privat salah ukuran (${secretKey.length} bytes). Harus 32 atau 64 bytes.`);
     }
 
-    console.log(`🔑 Wallet dimuat: ${wallet.publicKey.toBase58()}`);
+    log.wallet(`Jupiter client: ${wallet.publicKey.toBase58()}`);
     return wallet.publicKey.toBase58();
 }
 

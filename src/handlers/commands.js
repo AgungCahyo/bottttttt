@@ -4,6 +4,7 @@ const state   = require('../config/state');
 const { formatUptime } = require('../utils/helpers');
 const { sendToChannel } = require('../services/telegram');
 const { fetchCryptoNews } = require('../services/news');
+const log = require('../utils/logger');
 
 // ============================================================
 // ADMIN GUARD
@@ -41,7 +42,7 @@ function registerHandlers(bot) {
     // Logging middleware
     bot.use(async (ctx, next) => {
         const user = ctx.from ? `@${ctx.from.username || ctx.from.id}` : 'unknown';
-        console.log(`📩 [${user}] ${ctx.message?.text || ctx.updateType}`);
+        log.cmd(`[${user}] ${ctx.message?.text || ctx.updateType}`);
         return next();
     });
 
@@ -114,7 +115,7 @@ function registerHandlers(bot) {
         }
     });
 
-    console.log('✅ Main command handlers terdaftar.');
+    log.ok('Main command handlers terdaftar');
 }
 
 function registerFallbackHandler(bot) {
@@ -122,7 +123,7 @@ function registerFallbackHandler(bot) {
         if (ctx.message.text.startsWith('/'))
             return ctx.reply('❓ Perintah tidak dikenal. Ketik /help.');
     });
-    console.log('✅ Fallback handler terdaftar.');
+    log.ok('Fallback handler terdaftar');
 }
 
 module.exports = { registerHandlers, registerFallbackHandler, isAdmin, requireAdmin };

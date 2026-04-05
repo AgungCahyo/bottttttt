@@ -43,6 +43,7 @@ const {
 } = require('@solana/spl-token');
 const axios = require('axios');
 const bs58  = require('bs58').default || require('bs58');
+const log   = require('../utils/logger');
 
 // ============================================================
 // CONSTANTS
@@ -91,7 +92,7 @@ function init(rpcUrl, privateKeyBase58) {
     else if (secretKey.length === 32) wallet = Keypair.fromSeed(secretKey);
     else throw new Error(`Private key ukuran salah: ${secretKey.length} bytes`);
 
-    console.log(`🔑 Wallet: ${wallet.publicKey.toBase58()}`);
+    log.wallet(wallet.publicKey.toBase58());
     return wallet.publicKey.toBase58();
 }
 
@@ -111,6 +112,13 @@ function createSafeError(message, details = {}) {
 }
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+/** Kurangi angka sim (token atau SOL) agar lebih konservatif vs eksekusi real. */
+function applySimExtraImpact(raw, extraBps) {
+    if (!(raw > 0) || !Number.isFinite(raw)) return raw;
+    const bps = Math.min(7500, Math.max(0, Math.floor(extraBps)));
+    return raw * (10000 - bps) / 10000;
+}
 
 // ============================================================
 // BALANCES
@@ -235,12 +243,12 @@ function pswapFeeConfigPda()     { return pda([Buffer.from('fee_config')], FEE_P
 // 15. fee_program               (readonly) ← Sep 2025
 // 16. bonding_curve_v2          (readonly) ← Feb 2026, SELALU TERAKHIR
 // ============================================================
-async function bondingCurveBuy({ outputMint, amountLamports, slippageBps = 1500 }) {
+async function bondingCurveBuy({ outputMint, amountLamports, slippageBps = 1500, priorityMicroLamports = 1_000_000 }) {
     const mint    = new PublicKey(outputMint);
     const mintStr = mint.toBase58().slice(0, 8) + '...';
     const solAmt  = amountLamports / LAMPORTS_PER_SOL;
 
-    console.log(`🎯 [BC] Buy ${solAmt.toFixed(4)} SOL → ${mintStr}`);
+    log.rpc(`[BC] Buy ${solAmt.toFixed(4)} SOL → ${mintStr}`);
 
     const bal = await getSolBalance();
     if (bal < solAmt + 0.02) {
@@ -336,9 +344,10 @@ async function bondingCurveBuy({ outputMint, amountLamports, slippageBps = 1500 
 
     const feeRecipient = await getFeeRecipient({ mayhemMode: !!bondingCurveDecoded.isMayhemMode });
 
+    const prio = Math.max(1, Math.floor(priorityMicroLamports));
     const instructions = [
         ComputeBudgetProgram.setComputeUnitLimit({ units: 350_000 }),
-        ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 1_000_000 }),
+        ComputeBudgetProgram.setComputeUnitPrice({ microLamports: prio }),
     ];
 
     if (bcFresh.data.length < BONDING_CURVE_NEW_SIZE) {
@@ -381,7 +390,7 @@ async function bondingCurveBuy({ outputMint, amountLamports, slippageBps = 1500 
 // BONDING CURVE SELL — Anchor + quote (selaras @pump-fun/pump-sdk)
 // Cashback coin: remainingAccounts [user_vol_acc, bonding_curve_v2]
 // ============================================================
-async function bondingCurveSell({ inputMint, amountTokens, slippageBps = 1500 }) {
+async function bondingCurveSell({ inputMint, amountTokens, slippageBps = 1500, priorityMicroLamports = 1_000_000 }) {
     const mint    = new PublicKey(inputMint);
     const mintStr = mint.toBase58().slice(0, 8) + '...';
 
@@ -446,9 +455,10 @@ async function bondingCurveSell({ inputMint, amountTokens, slippageBps = 1500 })
 
     const feeRecipient = await getFeeRecipient({ mayhemMode: !!bondingCurveDecoded.isMayhemMode });
 
+    const prio = Math.max(1, Math.floor(priorityMicroLamports));
     const instructions = [
         ComputeBudgetProgram.setComputeUnitLimit({ units: 350_000 }),
-        ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 1_000_000 }),
+        ComputeBudgetProgram.setComputeUnitPrice({ microLamports: prio }),
     ];
 
     if (bcAcc.data.length < BONDING_CURVE_NEW_SIZE) {
@@ -483,7 +493,7 @@ async function bondingCurveSell({ inputMint, amountTokens, slippageBps = 1500 })
     instructions.push(sellIx);
 
     const minSolUi = Number(minSolBn.toString()) / LAMPORTS_PER_SOL;
-    console.log(`💸 [BC] Sell ${amountTokens.toFixed(2)} tokens | cashback=${cashback} | minSOL≈${minSolUi.toFixed(6)}`);
+    log.rpc(`[BC] Sell ${amountTokens.toFixed(2)} tok | cashback=${cashback} | minSOL≈${minSolUi.toFixed(6)}`);
 
     const solBefore = await getSolBalance();
     let txid = null;
@@ -492,7 +502,7 @@ async function bondingCurveSell({ inputMint, amountTokens, slippageBps = 1500 })
 
         await sleep(2000);
         const solReceived = Math.max(0, (await getSolBalance()) - solBefore);
-        console.log(`✅ [BC] Sell sukses: +${solReceived.toFixed(4)} SOL`);
+        log.txOk(`[BC] Sell +${solReceived.toFixed(4)} SOL`);
         return { txid, outputAmount: solReceived, isSimulation: false, route: 'bonding_curve' };
     } catch (err) {
         let logs = err?.logs;
@@ -510,10 +520,10 @@ async function bondingCurveSell({ inputMint, amountTokens, slippageBps = 1500 })
 // ============================================================
 // PUMPSWAP AMM BUY (Nov 2025 + creator fee + Sep 2025)
 // ============================================================
-async function pumpswapBuy({ outputMint, amountLamports, slippageBps = 1500 }) {
+async function pumpswapBuy({ outputMint, amountLamports, slippageBps = 1500, priorityMicroLamports = 1_000_000 }) {
     const baseMint = new PublicKey(outputMint);
     const solAmt   = amountLamports / LAMPORTS_PER_SOL;
-    console.log(`🔄 [AMM] PumpSwap buy ${solAmt.toFixed(4)} SOL → ${baseMint.toBase58().slice(0, 8)}...`);
+    log.rpc(`[AMM] PumpSwap buy ${solAmt.toFixed(4)} SOL → ${baseMint.toBase58().slice(0, 8)}…`);
 
     const bal = await getSolBalance();
     if (bal < solAmt + 0.025) throw createSafeError(`SOL kurang: ${bal.toFixed(4)}`, { code: 'INSUFFICIENT_FUNDS' });
@@ -560,9 +570,10 @@ async function pumpswapBuy({ outputMint, amountLamports, slippageBps = 1500 }) {
     data.writeBigUInt64LE(baseAmountOut, 8);
     data.writeBigUInt64LE(maxQuoteIn, 16);
 
+    const prio = Math.max(1, Math.floor(priorityMicroLamports));
     const instructions = [
         ComputeBudgetProgram.setComputeUnitLimit({ units: 450_000 }),
-        ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 1_000_000 }),
+        ComputeBudgetProgram.setComputeUnitPrice({ microLamports: prio }),
     ];
 
     // Extend pool jika < 300 bytes
@@ -633,7 +644,7 @@ async function pumpswapBuy({ outputMint, amountLamports, slippageBps = 1500 }) {
 // ============================================================
 // PUMPSWAP AMM SELL
 // ============================================================
-async function pumpswapSell({ inputMint, amountTokens, slippageBps = 1500 }) {
+async function pumpswapSell({ inputMint, amountTokens, slippageBps = 1500, priorityMicroLamports = 1_000_000 }) {
     const baseMint = new PublicKey(inputMint);
     const pool     = await findPool(baseMint);
 
@@ -664,9 +675,10 @@ async function pumpswapSell({ inputMint, amountTokens, slippageBps = 1500 }) {
     data.writeBigUInt64LE(baseAmountIn, 8);
     data.writeBigUInt64LE(1n, 16);
 
+    const prio = Math.max(1, Math.floor(priorityMicroLamports));
     const instructions = [
         ComputeBudgetProgram.setComputeUnitLimit({ units: 450_000 }),
-        ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 1_000_000 }),
+        ComputeBudgetProgram.setComputeUnitPrice({ microLamports: prio }),
     ];
 
     if (pool.dataLen < 300) {
@@ -723,7 +735,7 @@ async function pumpswapSell({ inputMint, amountTokens, slippageBps = 1500 }) {
     // Unwrap WSOL → SOL
     instructions.push(createCloseAccountInstruction(userQuoteAta, wallet.publicKey, wallet.publicKey));
 
-    console.log(`💸 [AMM] PumpSwap sell ${amountTokens.toFixed(2)} tokens`);
+    log.rpc(`[AMM] PumpSwap sell ${amountTokens.toFixed(2)} tok`);
     const solBefore = await getSolBalance();
     let txid = null;
     try {
@@ -746,7 +758,7 @@ async function pumpswapSell({ inputMint, amountTokens, slippageBps = 1500 }) {
 // JUPITER FALLBACK
 // ============================================================
 async function jupiterBuy({ outputMint, amountLamports, slippageBps }) {
-    console.log(`🪐 [Jupiter] Fallback buy...`);
+    log.jupiter('Fallback buy…');
     const { data: q } = await axios.get('https://api.jup.ag/swap/v1/quote', {
         params: { inputMint: SOL_MINT, outputMint, amount: amountLamports, slippageBps }, timeout: 10_000,
     });
@@ -766,7 +778,7 @@ async function jupiterBuy({ outputMint, amountLamports, slippageBps }) {
 }
 
 async function jupiterSell({ inputMint, amountTokens, slippageBps }) {
-    console.log(`🪐 [Jupiter] Fallback sell...`);
+    log.jupiter('Fallback sell…');
     const amount = Math.floor(amountTokens * 1e6);
     const { data: q } = await axios.get('https://api.jup.ag/swap/v1/quote', {
         params: { inputMint, outputMint: SOL_MINT, amount, slippageBps }, timeout: 10_000,
@@ -896,7 +908,7 @@ async function sendAndConfirmFresh(instructions, route) {
         } catch (err) {
             lastErr = err;
             if (attempt === 0 && _isBlockhashExpiredError(err)) {
-                console.warn(`⚠️ [${route}] Blockhash kedaluwarsa, kirim ulang…`);
+                log.slot(`[${route}] Blockhash kedaluwarsa — kirim ulang`);
                 continue;
             }
             throw err;
@@ -909,7 +921,7 @@ async function sendTx(instructions, outputMint, solAmt, route) {
     let txid = null;
     try {
         txid = await sendAndConfirmFresh(instructions, route);
-        console.log(`✅ [${route}] TX: ${txid.slice(0, 8)}...`);
+        log.txOk(`[${route}] ${txid.slice(0, 8)}…`);
         await sleep(2000);
         const tokensOut = await getBalance(outputMint).catch(() => 0);
         return { txid, inputAmount: solAmt, outputAmount: tokensOut, isSimulation: false, route };
@@ -925,11 +937,279 @@ async function sendTx(instructions, outputMint, solAmt, route) {
         const msg = err?.message || String(err);
         if (Array.isArray(logs) && logs.length) {
             const preview = logs.slice(0, 8).join('\n   ');
-            console.error(`❌ [${route}] program logs:\n   ${preview}${logs.length > 8 ? '\n   …' : ''}`);
+            log.txErr(`[${route}] program logs:\n   ${preview}${logs.length > 8 ? '\n   …' : ''}`);
         }
-        console.error(`❌ [${route}] FAILED: ${msg}`);
+        log.txErr(`[${route}] FAILED: ${msg}`);
         throw createSafeError(msg, { logs: Array.isArray(logs) ? logs : [], txid, code: 'TX_ERROR' });
     }
+}
+
+// ============================================================
+// SIMULASI = DRY-RUN QUOTE (proses routing sama persis; tanpa kirim TX)
+// Buy/sell nyata bisa sedikit beda karena slippage & antrian; tidak ada jaminan profit.
+// ============================================================
+async function quoteBondingCurveBuyUi(outputMint, amountLamports) {
+    const mint    = new PublicKey(outputMint);
+    const mintStr = mint.toBase58().slice(0, 8) + '...';
+
+    let mintInfo = null;
+    for (let i = 0; i < 20; i++) {
+        mintInfo = await connection.getAccountInfo(mint);
+        if (mintInfo) break;
+        await sleep(400);
+    }
+    if (!mintInfo) throw createSafeError(`Token belum ada: ${mintStr}`, { code: 'TOKEN_NOT_FOUND' });
+
+    const bc = await fetchBondingCurve(outputMint);
+    if (bc.complete) {
+        throw createSafeError('Bonding curve graduated / selesai', { code: 'GRADUATED' });
+    }
+
+    const bcPda = bondingCurvePda(mint);
+    const fcPda = feeConfigPda();
+
+    const globalInfo = await connection.getAccountInfo(GLOBAL_STATE_PDA);
+    if (!globalInfo?.data) {
+        throw createSafeError('Global pump state tidak ditemukan', { code: 'GLOBAL_NOT_FOUND' });
+    }
+
+    let global;
+    try {
+        global = PUMP_SDK.decodeGlobal(globalInfo);
+    } catch (e) {
+        throw createSafeError(`Decode global gagal: ${e?.message || e}`, { code: 'GLOBAL_DECODE' });
+    }
+
+    const bcFresh = await connection.getAccountInfo(bcPda);
+    if (!bcFresh?.data?.length) {
+        throw createSafeError(`Bonding curve tidak ada: ${mintStr}`, { code: 'BC_NOT_FOUND' });
+    }
+
+    let bondingCurveDecoded;
+    try {
+        bondingCurveDecoded = PUMP_SDK.decodeBondingCurve(bcFresh);
+    } catch (e) {
+        throw createSafeError(`Decode BC fresh gagal: ${e?.message || e}`, { code: 'BC_DECODE' });
+    }
+    if (bondingCurveDecoded.complete) {
+        throw createSafeError('Bonding curve graduated (saat quote)', { code: 'GRADUATED' });
+    }
+
+    let feeConfig = null;
+    try {
+        const fcInfo = await connection.getAccountInfo(fcPda);
+        if (fcInfo?.data) feeConfig = PUMP_SDK.decodeFeeConfig(fcInfo);
+    } catch { /* optional */ }
+
+    const spendBn = new BN(amountLamports);
+    const expectedTokens = getBuyTokenAmountFromSolAmount({
+        global,
+        feeConfig,
+        mintSupply: bondingCurveDecoded.tokenTotalSupply,
+        bondingCurve: bondingCurveDecoded,
+        amount: spendBn,
+    });
+    if (expectedTokens.lten(0)) {
+        throw createSafeError('Quote token = 0', { code: 'ZERO_QUOTE' });
+    }
+
+    return Number(expectedTokens.toString()) / 1e6;
+}
+
+async function quoteBondingCurveSellSol(inputMint, amountTokens) {
+    const mint    = new PublicKey(inputMint);
+    const mintStr = mint.toBase58().slice(0, 8) + '...';
+
+    const bc    = await fetchBondingCurve(inputMint);
+    const bcPda = bondingCurvePda(mint);
+    const fcPda = feeConfigPda();
+
+    const bcAcc = bc.accountInfo || await connection.getAccountInfo(bcPda);
+    if (!bcAcc?.data?.length) {
+        throw createSafeError(`Bonding curve tidak ada: ${mintStr}`, { code: 'BC_NOT_FOUND' });
+    }
+
+    const globalInfo = await connection.getAccountInfo(GLOBAL_STATE_PDA);
+    if (!globalInfo?.data) {
+        throw createSafeError('Global pump state tidak ditemukan', { code: 'GLOBAL_NOT_FOUND' });
+    }
+
+    let global;
+    try {
+        global = PUMP_SDK.decodeGlobal(globalInfo);
+    } catch (e) {
+        throw createSafeError(`Decode global gagal: ${e?.message || e}`, { code: 'GLOBAL_DECODE' });
+    }
+
+    let bondingCurveDecoded;
+    try {
+        bondingCurveDecoded = PUMP_SDK.decodeBondingCurve(bcAcc);
+    } catch (e) {
+        throw createSafeError(`Decode bonding curve gagal: ${e?.message || e}`, { code: 'BC_DECODE' });
+    }
+
+    let feeConfig = null;
+    try {
+        const fcInfo = await connection.getAccountInfo(fcPda);
+        if (fcInfo?.data) feeConfig = PUMP_SDK.decodeFeeConfig(fcInfo);
+    } catch { /* optional */ }
+
+    const amountBn = new BN(Math.floor(amountTokens * 1e6));
+    const expectedSolLamports = getSellSolAmountFromTokenAmount({
+        global,
+        feeConfig,
+        mintSupply: bondingCurveDecoded.tokenTotalSupply,
+        bondingCurve: bondingCurveDecoded,
+        amount: amountBn,
+    });
+
+    return Math.max(0, Number(expectedSolLamports.toString()) / LAMPORTS_PER_SOL);
+}
+
+async function quotePumpSwapBuyUi(outputMint, amountLamports, slippageBps = 1500) {
+    const baseMint = new PublicKey(outputMint);
+    const pool     = await findPool(baseMint);
+    const br       = await connection.getTokenAccountBalance(pool.pool_base_token_account);
+    const qr       = await connection.getTokenAccountBalance(pool.pool_quote_token_account);
+    const B        = BigInt(br.value.amount);
+    const Q        = BigInt(qr.value.amount);
+    const I        = BigInt(amountLamports);
+    if (B <= 0n || Q <= 0n) throw createSafeError('Pool kosong', { code: 'POOL_EMPTY' });
+    let baseAmountOut = ((I * B) / (Q + I)) * BigInt(10000 - Math.min(Math.max(0, slippageBps), 9999)) / 10000n;
+    if (baseAmountOut < 1n) baseAmountOut = 1n;
+    return Number(baseAmountOut) / 1e6;
+}
+
+async function quotePumpSwapSellSol(inputMint, amountTokens, slippageBps = 1500) {
+    const baseMint = new PublicKey(inputMint);
+    const pool     = await findPool(baseMint);
+    const br       = await connection.getTokenAccountBalance(pool.pool_base_token_account);
+    const qr       = await connection.getTokenAccountBalance(pool.pool_quote_token_account);
+    const B        = BigInt(br.value.amount);
+    const Q        = BigInt(qr.value.amount);
+    const baseIn   = BigInt(Math.floor(amountTokens * 1e6));
+    if (B <= 0n || Q <= 0n || baseIn <= 0n) throw createSafeError('Pool/sell invalid', { code: 'POOL_EMPTY' });
+    const quoteOut = (baseIn * Q) / (B + baseIn);
+    const adj      = quoteOut * BigInt(10000 - Math.min(Math.max(0, slippageBps), 9999)) / 10000n;
+    return Math.max(0, Number(adj) / LAMPORTS_PER_SOL);
+}
+
+function _jupiterOutTokenUi(q) {
+    if (!q?.outAmount) return 0;
+    const raw = BigInt(q.outAmount);
+    const dec = Number(q.outputMintInfo?.decimals ?? q.outDecimals ?? 6);
+    return Number(raw) / 10 ** dec;
+}
+
+function _jupiterOutSol(q) {
+    if (!q?.outAmount) return 0;
+    return Number(BigInt(q.outAmount)) / LAMPORTS_PER_SOL;
+}
+
+async function quoteJupiterBuyUi(outputMint, amountLamports, slippageBps = 1500) {
+    const { data: q } = await axios.get('https://api.jup.ag/swap/v1/quote', {
+        params: { inputMint: SOL_MINT, outputMint, amount: amountLamports, slippageBps },
+        timeout: 12_000,
+    });
+    if (!q?.outAmount) throw createSafeError('Jupiter quote buy kosong', { code: 'JUP_QUOTE' });
+    const ui = _jupiterOutTokenUi(q);
+    if (ui <= 0) throw createSafeError('Jupiter quote buy = 0', { code: 'JUP_QUOTE' });
+    return ui;
+}
+
+async function quoteJupiterSellSol(inputMint, amountTokens, slippageBps = 1500) {
+    const amount = Math.floor(amountTokens * 1e6);
+    const { data: q } = await axios.get('https://api.jup.ag/swap/v1/quote', {
+        params: { inputMint, outputMint: SOL_MINT, amount, slippageBps },
+        timeout: 12_000,
+    });
+    if (!q?.outAmount) throw createSafeError('Jupiter quote sell kosong', { code: 'JUP_QUOTE' });
+    const sol = _jupiterOutSol(q);
+    if (sol <= 0) throw createSafeError('Jupiter quote sell = 0', { code: 'JUP_QUOTE' });
+    return sol;
+}
+
+async function executeSwapSimulated({ outputMint, amountLamports, slippageBps = 1500 }) {
+    const CONFIG = require('../config');
+    const impactBps = CONFIG.SIM_EXTRA_IMPACT_BPS || 0;
+    const solAmt = amountLamports / LAMPORTS_PER_SOL;
+    const txid   = `sim_${Date.now().toString(36)}`;
+    const graduated = await isGraduated(outputMint);
+
+    if (!graduated) {
+        try {
+            const rawTok = await quoteBondingCurveBuyUi(outputMint, amountLamports);
+            const tokensUi = applySimExtraImpact(rawTok, impactBps);
+            log.sim(`Quote BC buy → ${tokensUi.toFixed(2)} tok | ${outputMint.slice(0, 8)}…`);
+            return { txid, inputAmount: solAmt, outputAmount: tokensUi, isSimulation: true, route: 'bonding_curve' };
+        } catch (e) {
+            const code = e?.code || '';
+            const msg  = e?.message || '';
+            if (code !== 'GRADUATED' && !String(msg).includes('GRADUATED')) throw e;
+            log.sim('BC graduated saat quote → AMM/Jupiter');
+        }
+    }
+
+    try {
+        const rawTok = await quotePumpSwapBuyUi(outputMint, amountLamports, slippageBps);
+        if (rawTok > 0) {
+            const tokensUi = applySimExtraImpact(rawTok, impactBps);
+            log.sim(`Quote PumpSwap buy → ${tokensUi.toFixed(2)} tok`);
+            return { txid, inputAmount: solAmt, outputAmount: tokensUi, isSimulation: true, route: 'pumpswap_amm' };
+        }
+    } catch (e) {
+        log.warn(`[SIM] PumpSwap quote: ${e?.message?.slice(0, 72) || e}`);
+    }
+
+    const rawJ = await quoteJupiterBuyUi(outputMint, amountLamports, slippageBps);
+    const tokensUi = applySimExtraImpact(rawJ, impactBps);
+    log.sim(`Quote Jupiter buy → ${tokensUi.toFixed(2)} tok`);
+    return { txid, inputAmount: solAmt, outputAmount: tokensUi, isSimulation: true, route: 'jupiter' };
+}
+
+async function executeSellSimulated({ inputMint, amountTokens, slippageBps = 1500 }) {
+    const CONFIG = require('../config');
+    const impactBps = CONFIG.SIM_EXTRA_IMPACT_BPS || 0;
+    const txid = `sim_sell_${Date.now().toString(36)}`;
+
+    const balance = await getBalance(inputMint);
+    if (balance <= 0) {
+        const e = new Error('Saldo token 0');
+        e.logs = [];
+        throw e;
+    }
+    const actualSell = Math.min(amountTokens, balance);
+    const graduated  = await isGraduated(inputMint);
+
+    if (!graduated) {
+        try {
+            const rawSol = await quoteBondingCurveSellSol(inputMint, actualSell);
+            const solOut = applySimExtraImpact(rawSol, impactBps);
+            log.sim(`Quote BC sell → ${solOut.toFixed(6)} SOL`);
+            return { txid, outputAmount: solOut, isSimulation: true, route: 'bonding_curve' };
+        } catch (e) {
+            const code = e?.code || '';
+            const msg  = e?.message || '';
+            if (code !== 'GRADUATED' && !String(msg).includes('GRADUATED')) throw e;
+            log.sim('BC graduated saat sell quote → AMM/Jupiter');
+        }
+    }
+
+    try {
+        const rawSol = await quotePumpSwapSellSol(inputMint, actualSell, slippageBps);
+        if (rawSol > 0) {
+            const solOut = applySimExtraImpact(rawSol, impactBps);
+            log.sim(`Quote PumpSwap sell → ${solOut.toFixed(6)} SOL`);
+            return { txid, outputAmount: solOut, isSimulation: true, route: 'pumpswap_amm' };
+        }
+    } catch (e) {
+        log.warn(`[SIM] PumpSwap sell quote: ${e?.message?.slice(0, 72) || e}`);
+    }
+
+    const rawJ = await quoteJupiterSellSol(inputMint, actualSell, slippageBps);
+    const solOut = applySimExtraImpact(rawJ, impactBps);
+    log.sim(`Quote Jupiter sell → ${solOut.toFixed(6)} SOL`);
+    return { txid, outputAmount: solOut, isSimulation: true, route: 'jupiter' };
 }
 
 // ============================================================
@@ -951,56 +1231,75 @@ async function getTokenPriceInSol(mintAddress) {
     return null;
 }
 
+/** Mark harga SOL/token: BC dari quote SDK (realtime on-chain), atau DexScreener/Jupiter jika sudah graduate. */
+async function getSpotSolPerToken(mintAddress) {
+    const graduated = await isGraduated(mintAddress).catch(() => true);
+    if (!graduated) {
+        try {
+            const probeLamports = 150_000; // ~0.00015 SOL — cukup untuk marginal price tanpa membebani kurva
+            const tokensUi = await quoteBondingCurveBuyUi(mintAddress, probeLamports);
+            if (tokensUi > 0) return (probeLamports / LAMPORTS_PER_SOL) / tokensUi;
+        } catch { /* race graduate / RPC */ }
+    }
+    return getTokenPriceInSol(mintAddress);
+}
+
 // ============================================================
 // MAIN APIs — AUTO ROUTER
 // ============================================================
-async function executeSwap({ outputMint, amountLamports, slippageBps = 1500, isSimulation = false }) {
+async function executeSwap({ outputMint, amountLamports, slippageBps = 1500, isSimulation = false, priorityMicroLamports } = {}) {
     if (!connection || !wallet) throw createSafeError('pumpClient belum init', { code: 'NOT_INIT' });
     const solAmt = amountLamports / LAMPORTS_PER_SOL;
 
     if (isSimulation) {
-        return {
-            txid: `sim_${Date.now().toString(36)}`, inputAmount: solAmt,
-            outputAmount: Math.floor(solAmt * 1_000_000 * (0.8 + Math.random() * 0.4)),
-            isSimulation: true, route: 'simulation',
-        };
+        return executeSwapSimulated({ outputMint, amountLamports, slippageBps });
     }
 
-    const graduated = await isGraduated(outputMint);
-    console.log(`🔍 ${outputMint.slice(0, 8)}... | Graduate: ${graduated}`);
+    const CONFIG = require('../config');
+    const prio = (priorityMicroLamports != null && priorityMicroLamports > 0)
+        ? Math.floor(priorityMicroLamports)
+        : CONFIG.PRIORITY_MICRO_LAMPORTS_DEFAULT;
 
-    if (!graduated) return await bondingCurveBuy({ outputMint, amountLamports, slippageBps });
+    const graduated = await isGraduated(outputMint);
+    log.rpc(`${outputMint.slice(0, 8)}… | graduate: ${graduated}`);
+
+    if (!graduated) return await bondingCurveBuy({ outputMint, amountLamports, slippageBps, priorityMicroLamports: prio });
 
     try {
-        return await pumpswapBuy({ outputMint, amountLamports, slippageBps });
+        return await pumpswapBuy({ outputMint, amountLamports, slippageBps, priorityMicroLamports: prio });
     } catch (e) {
         const msg = e?.message || '';
         if (msg.includes('INSUFFICIENT_FUNDS') || msg.includes('POOL_NOT_FOUND')) throw e;
-        console.warn(`⚠️ PumpSwap gagal, coba Jupiter: ${msg.slice(0, 80)}`);
+        log.warn(`PumpSwap gagal → Jupiter: ${msg.slice(0, 80)}`);
         return await jupiterBuy({ outputMint, amountLamports, slippageBps });
     }
 }
 
-async function executeSell({ inputMint, amountTokens, slippageBps = 1500, isSimulation = false }) {
+async function executeSell({ inputMint, amountTokens, slippageBps = 1500, isSimulation = false, priorityMicroLamports } = {}) {
     if (!connection || !wallet) throw new Error('pumpClient belum init');
 
     if (isSimulation) {
-        return { txid: `sim_sell_${Date.now().toString(36)}`, outputAmount: 0, isSimulation: true, route: 'simulation' };
+        return executeSellSimulated({ inputMint, amountTokens, slippageBps });
     }
+
+    const CONFIG = require('../config');
+    const prio = (priorityMicroLamports != null && priorityMicroLamports > 0)
+        ? Math.floor(priorityMicroLamports)
+        : CONFIG.PRIORITY_MICRO_LAMPORTS_DEFAULT;
 
     const balance = await getBalance(inputMint);
     if (balance <= 0) { const e = new Error('Saldo token 0'); e.logs = []; throw e; }
 
     const actualSell = Math.min(amountTokens, balance);
     const graduated  = await isGraduated(inputMint);
-    console.log(`🔍 Sell ${inputMint.slice(0, 8)}... | Graduate: ${graduated}`);
+    log.rpc(`Sell ${inputMint.slice(0, 8)}… | graduate: ${graduated}`);
 
-    if (!graduated) return await bondingCurveSell({ inputMint, amountTokens: actualSell, slippageBps });
+    if (!graduated) return await bondingCurveSell({ inputMint, amountTokens: actualSell, slippageBps, priorityMicroLamports: prio });
 
     try {
-        return await pumpswapSell({ inputMint, amountTokens: actualSell, slippageBps });
+        return await pumpswapSell({ inputMint, amountTokens: actualSell, slippageBps, priorityMicroLamports: prio });
     } catch (e) {
-        console.warn(`⚠️ PumpSwap sell gagal, Jupiter: ${e?.message?.slice(0, 80)}`);
+        log.warn(`PumpSwap sell → Jupiter: ${e?.message?.slice(0, 80)}`);
         return await jupiterSell({ inputMint, amountTokens: actualSell, slippageBps });
     }
 }
@@ -1010,6 +1309,6 @@ async function executeSell({ inputMint, amountTokens, slippageBps = 1500, isSimu
 // ============================================================
 module.exports = {
     init, getWalletAddress, getSolBalance, getBalance,
-    getTokenPriceInSol, executeSwap, executeSell, isGraduated,
+    getTokenPriceInSol, getSpotSolPerToken, executeSwap, executeSell, isGraduated,
     SOL_MINT, createSafeError,
 };

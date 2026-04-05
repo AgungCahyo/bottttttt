@@ -1,6 +1,7 @@
 'use strict';
 const engine  = require('../trading/tradingEngine');
 const { esc, sleep } = require('../utils/helpers');
+const log     = require('../utils/logger');
 
 function registerTradingHandlers(bot, isAdmin, requireAdmin) {
 
@@ -276,7 +277,7 @@ function registerTradingHandlers(bot, isAdmin, requireAdmin) {
         return ctx.reply(`✅ <code>${mint}</code> dihapus.`, { parse_mode: 'HTML' });
     });
 
-    console.log('✅ Trading command handlers terdaftar.');
+    log.ok('Trading command handlers terdaftar');
 }
 
 module.exports = { registerTradingHandlers };

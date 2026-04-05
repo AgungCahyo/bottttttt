@@ -8,20 +8,78 @@ const dca          = require('./strategies/dca');
 const grid         = require('./strategies/grid');
 const { sendToChannel } = require('../services/telegram');
 const { esc, sleep }    = require('../utils/helpers');
+const log               = require('../utils/logger');
 
 // ============================================================
 // CONSTANTS
 // ============================================================
-const PRICE_CHECK_INTERVAL_MS  = 3_000;   // cek harga tiap 3 detik
+const PRICE_CHECK_INTERVAL_MS  = 2_000;   // cadangan polling (stream = utama)
 const DCA_TICK_INTERVAL_MS     = 60_000;
 const MAX_POSITIONS            = 10;       // maksimal posisi terbuka bersamaan
-const PRICE_REQUEST_DELAY_MS   = 1_200;   // jeda antar token saat cek harga
+const PRICE_REQUEST_DELAY_MS   = 800;    // jeda antar token (kurangi delay vs stream)
 const MAX_POSITION_AGE_MS      = 3_600_000; // auto-close posisi simulasi > 1 jam
 
 const buyLockSet = new Set();
 const stopLossInflight = new Set();
+/** @type {Map<string, number[]>} sampel harga stream per mint — SL pakai rata-rata (anti-wick) */
+const streamPriceBuffer = new Map();
 let initialized  = false;
 let isSimMode    = true; // ditentukan saat init
+
+function _streamSlParams() {
+    const c = require('../config');
+    const window = Math.max(2, Number(c.STREAM_SL_AVG_WINDOW) || 3);
+    const minSamples = Math.min(Math.max(2, Number(c.STREAM_SL_MIN_SAMPLES) || 2), window);
+    return { window, minSamples };
+}
+
+function _pushStreamPrice(mint, price) {
+    if (!mint || !(price > 0)) return;
+    const { window } = _streamSlParams();
+    let buf = streamPriceBuffer.get(mint) || [];
+    buf.push(price);
+    if (buf.length > window) buf = buf.slice(-window);
+    streamPriceBuffer.set(mint, buf);
+}
+
+function _streamAvgForSl(mint) {
+    const buf = streamPriceBuffer.get(mint) || [];
+    if (buf.length === 0) return null;
+    return buf.reduce((a, b) => a + b, 0) / buf.length;
+}
+
+function priorityMicroForPos(pos) {
+    const c = require('../config');
+    const s = pos?.scoreAtEntry;
+    if (typeof s === 'number' && s >= c.PRIORITY_SCORE_HIGH) return c.PRIORITY_MICRO_LAMPORTS_HIGH;
+    return c.PRIORITY_MICRO_LAMPORTS_DEFAULT;
+}
+
+async function executeSellWithDustPasses(inputMint, amountTokens, { slippageBps, isSimulation, priorityMicroLamports }, dustSweep = false) {
+    const CONFIG = require('../config');
+    const sellOnce = (amt) => pump.executeSell({
+        inputMint,
+        amountTokens: amt,
+        slippageBps,
+        isSimulation,
+        priorityMicroLamports,
+    });
+    const bal0 = await pump.getBalance(inputMint);
+    const firstAmt = Math.min(amountTokens, bal0 > 0 ? bal0 : amountTokens);
+    let result = await sellOnce(firstAmt);
+    if (!dustSweep || isSimulation || CONFIG.SELL_DUST_EXTRA_ROUNDS <= 0) return result;
+    for (let r = 0; r < CONFIG.SELL_DUST_EXTRA_ROUNDS; r++) {
+        await sleep(1200);
+        const bal = await pump.getBalance(inputMint);
+        if (!bal || bal <= CONFIG.TOKEN_DUST_THRESHOLD_UI) break;
+        try {
+            result = await sellOnce(bal);
+        } catch {
+            break;
+        }
+    }
+    return result;
+}
 
 // ============================================================
 // INIT
@@ -55,17 +113,17 @@ function init({ rpcUrl, privateKeyBase58 }) {
             restored++;
         }
     }
-    if (restored > 0) console.log(`♻️  Trailing stop restored: ${restored} posisi`);
+    if (restored > 0) log.info(`Trailing stop restored: ${restored} posisi`);
 
     // Tampilkan ringkasan posisi
     const allPos = posTracker.getAllPositions();
-    console.log(`📊 Posisi aktif: ${allPos.length} | Mode: ${isSimMode ? 'SIMULASI' : 'REAL TRADING'}`);
+    log.info(`Posisi aktif: ${allPos.length} | mode: ${isSimMode ? 'SIMULASI' : 'REAL TRADING'}`);
 
     setInterval(dcaTick, DCA_TICK_INTERVAL_MS);
     setInterval(priceMonitorTick, PRICE_CHECK_INTERVAL_MS);
 
     initialized = true;
-    console.log(`✅ Trading Engine aktif — wallet: ${walletAddress}`);
+    log.engine(`Aktif — wallet: ${walletAddress}`);
 
     // --- POS EVENT LISTENERS (Streaming Subscriptions) ---
     posTracker.on('opened', (pos) => {
@@ -76,6 +134,7 @@ function init({ rpcUrl, privateKeyBase58 }) {
     });
 
     posTracker.on('closed', (pos) => {
+        streamPriceBuffer.delete(pos.mint);
         try {
             const radar = require('../services/pumpRadar');
             radar.unsubscribeFromMint(pos.mint);
@@ -91,7 +150,7 @@ function _cleanupSimPositions() {
     const simPos = all.filter(p => p.isSimulation);
     if (simPos.length === 0) return;
 
-    console.log(`🧹 Membersihkan ${simPos.length} posisi simulasi lama (mode REAL aktif)...`);
+    log.clean(`Membersihkan ${simPos.length} posisi simulasi (mode REAL)…`);
     for (const pos of simPos) {
         posTracker.closePosition(pos.mint, { exitPriceSol: pos.entryPriceSol, reason: 'cleanup_sim' });
         trailingStop.removeTrail(pos.mint);
@@ -109,7 +168,7 @@ function _cleanupStalePositions() {
             cleaned++;
         }
     }
-    if (cleaned > 0) console.log(`🧹 ${cleaned} posisi simulasi kadaluarsa dibersihkan`);
+    if (cleaned > 0) log.clean(`${cleaned} posisi simulasi kadaluarsa dibersihkan`);
 }
 
 // ============================================================
@@ -117,7 +176,7 @@ function _cleanupStalePositions() {
 // ============================================================
 async function dcaTick() {
     try { await dca.tick(); }
-    catch (err) { console.error('❌ DCA tick error:', err.message); }
+    catch (err) { log.err(`DCA tick: ${err.message}`); }
 }
 
 // ============================================================
@@ -129,20 +188,25 @@ async function handleStreamPrice(mint, currentPrice) {
     if (!pos) return;
 
     try {
-        // 1. Cek Stop Loss
-        if (pos.stopLossPriceSol && currentPrice <= pos.stopLossPriceSol) {
-            console.log(`📡 [STREAM] SL Triggered: ${pos.symbol} @ ${currentPrice.toFixed(8)}`);
-            await executeStopLossClose(pos, currentPrice);
+        _pushStreamPrice(mint, currentPrice);
+        const { minSamples } = _streamSlParams();
+        const buf = streamPriceBuffer.get(mint) || [];
+        const avg = _streamAvgForSl(mint);
+
+        // 1. Stop loss dari stream: rata-rata window (kurangi panic pada wick tunggal)
+        if (pos.stopLossPriceSol && buf.length >= minSamples && avg != null && avg <= pos.stopLossPriceSol) {
+            log.stream(`SL (avg ${avg.toFixed(8)} ≤ SL) ${pos.symbol}`);
+            await executeStopLossClose(pos, avg);
             return;
         }
 
-        // 2. Grid logic
+        // 2. Grid logic (tetap pakai tick terkini)
         await grid.tick(mint, currentPrice);
 
         // 3. Trailing Stop
         const action = trailingStop.update(mint, currentPrice);
         if (action) {
-            console.log(`📡 [STREAM] Trail Action: ${pos.symbol} -> ${action.action}`);
+            log.stream(`Trail: ${pos.symbol} → ${action.action}`);
             await handleTrailAction(pos, action, currentPrice);
         }
     } catch (err) {
@@ -183,7 +247,7 @@ async function priceMonitorTick() {
 
         } catch (err) {
             if (!err.message?.includes('GRADUATED') && !err.message?.includes('429')) {
-                console.error(`❌ Price monitor [${pos.symbol}]:`, err.message);
+                log.err(`Price monitor [${pos.symbol}]: ${err.message}`);
             }
             await sleep(PRICE_REQUEST_DELAY_MS * 2); // backoff jika error
         }
@@ -191,11 +255,7 @@ async function priceMonitorTick() {
 }
 
 // ============================================================
-// STOP LOSS — statis (risk.maxLossPerTradePct), tidak pernah terhubung sebelumnya
-// ============================================================
-
-// ============================================================
-// STOP LOSS — statis (risk.maxLossPerTradePct), tidak pernah terhubung sebelumnya
+// STOP LOSS — statis (risk.maxLossPerTradePct)
 // ============================================================
 async function executeStopLossClose(pos, currentPriceSol) {
     const CONFIG = require('../config');
@@ -203,18 +263,19 @@ async function executeStopLossClose(pos, currentPriceSol) {
     if (stopLossInflight.has(mint)) return;
     stopLossInflight.add(mint);
     trailingStop.removeTrail(mint);
+    const prioMicro = priorityMicroForPos(pos);
+    const isSim = pos.isSimulation || CONFIG.ENABLE_SIMULATION_MODE;
     try {
         const balance = await pump.getBalance(mint);
         if (!balance || balance <= 0) {
             posTracker.closePosition(mint, { exitPriceSol: currentPriceSol, reason: 'stop_loss_empty' });
             return;
         }
-        const result = await pump.executeSell({
-            inputMint:    mint,
-            amountTokens: balance,
+        const result = await executeSellWithDustPasses(mint, balance, {
             slippageBps:  3000,
-            isSimulation: pos.isSimulation || CONFIG.ENABLE_SIMULATION_MODE,
-        });
+            isSimulation: isSim,
+            priorityMicroLamports: prioMicro,
+        }, true);
         const pnlSol = (currentPriceSol - pos.entryPriceSol) * balance;
         posTracker.closePosition(mint, {
             exitPriceSol: currentPriceSol,
@@ -228,10 +289,10 @@ async function executeStopLossClose(pos, currentPriceSol) {
             `📊 PnL: ${pnlSol >= 0 ? '+' : ''}${pnlSol.toFixed(4)} SOL\n` +
             `🔗 <a href="https://solscan.io/tx/${result.txid}">Solscan</a>`
         ).catch(() => {});
-        console.log(`🛑 Stop loss: ${pos.symbol} | PnL ${pnlSol.toFixed(4)} SOL`);
+        log.stopLoss(`${pos.symbol} | PnL ${pnlSol.toFixed(4)} SOL`);
     } catch (e) {
         const msg = e?.message || String(e);
-        console.error(`❌ Stop loss gagal [${pos.symbol}]:`, msg);
+        log.err(`Stop loss gagal [${pos.symbol}]: ${msg}`);
         await sendToChannel(
             `⚠️ <b>STOP LOSS GAGAL</b>\n🪙 ${esc(pos.symbol)}\n❗ ${esc(msg.slice(0, 120))}`
         ).catch(() => {});
@@ -263,12 +324,23 @@ async function handleTrailAction(pos, action, currentPriceSol) {
         }
         if (sellTokens <= 0) return;
 
-        const result = await pump.executeSell({
-            inputMint:    pos.mint,
-            amountTokens: sellTokens,
-            slippageBps:  2500,
-            isSimulation: pos.isSimulation || CONFIG.ENABLE_SIMULATION_MODE,
-        });
+        const dustSweep =
+            action.action === 'TRAIL_STOP'
+            || action.action === 'BREAKEVEN_STOP'
+            || (action.action === 'PARTIAL_SELL' && action.remaining <= 0.02);
+        const result = dustSweep
+            ? await executeSellWithDustPasses(pos.mint, sellTokens, {
+                slippageBps:  2500,
+                isSimulation: pos.isSimulation || CONFIG.ENABLE_SIMULATION_MODE,
+                priorityMicroLamports: priorityMicroForPos(pos),
+            }, true)
+            : await pump.executeSell({
+                inputMint:    pos.mint,
+                amountTokens: sellTokens,
+                slippageBps:  2500,
+                isSimulation: pos.isSimulation || CONFIG.ENABLE_SIMULATION_MODE,
+                priorityMicroLamports: priorityMicroForPos(pos),
+            });
 
         const pnlSol = (currentPriceSol - pos.entryPriceSol) * sellTokens;
         const pnlPct = ((currentPriceSol / pos.entryPriceSol) - 1) * 100;
@@ -310,7 +382,7 @@ async function handleTrailAction(pos, action, currentPriceSol) {
             `🔗 <a href="https://solscan.io/tx/${result.txid}">Solscan</a>`
         );
 
-        console.log(`${emoji} ${action.phase}: ${pos.symbol} @${action.multiplier}x`);
+        log.trade(`[${action.action}] ${action.phase}: ${pos.symbol} @ ${action.multiplier}x`);
 
     } catch (rawError) {
         let errorMsg = 'Trail action failed';
@@ -320,7 +392,7 @@ async function handleTrailAction(pos, action, currentPriceSol) {
             errorMsg = rawError?.toString?.() || errorMsg;
         }
 
-        console.error(`❌ Trail action gagal [${pos.symbol}]: ${errorMsg}`);
+        log.err(`Trail action gagal [${pos.symbol}]: ${errorMsg}`);
 
         if (!errorMsg.includes('GRADUATED') && !errorMsg.includes('0')) {
             await sendToChannel(
@@ -342,7 +414,7 @@ async function executeAutoBuy(mint, symbol, token, scoreResult) {
 
     // 🔒 Guard: batas maksimum posisi
     if (posTracker.getPositionCount() >= MAX_POSITIONS) {
-        console.warn(`⛔ Max posisi (${MAX_POSITIONS}) tercapai, skip ${symbol}`);
+        log.warn(`Max posisi (${MAX_POSITIONS}), skip ${symbol}`);
         return null;
     }
 
@@ -355,7 +427,7 @@ async function executeAutoBuy(mint, symbol, token, scoreResult) {
     // ✅ Risk validation
     const validation = riskManager.validateBuy({ mint, amountSol });
     if (!validation.allowed) {
-        console.warn(`⛔ Risk rejected [${symbol}]: ${validation.reason}`);
+        log.warn(`Risk rejected [${symbol}]: ${validation.reason}`);
         buyLockSet.delete(mint);
         return null;
     }
@@ -366,28 +438,34 @@ async function executeAutoBuy(mint, symbol, token, scoreResult) {
             const solBal = await pump.getSolBalance();
             const needed = amountSol + 0.02;
             if (solBal < needed) {
-                console.warn(`⛔ Low SOL balance: ${solBal.toFixed(4)} < ${needed.toFixed(4)}`);
+                log.warn(`SOL kurang: ${solBal.toFixed(4)} < ${needed.toFixed(4)}`);
                 buyLockSet.delete(mint);
                 return null;
             }
         } catch (e) {
-            console.error('❌ SOL balance check failed:', e?.message || 'unknown');
+            log.err(`SOL balance check: ${e?.message || 'unknown'}`);
             buyLockSet.delete(mint);
             return null;
         }
     }
 
     const modeTag = CONFIG.ENABLE_SIMULATION_MODE ? '[SIM]' : '[REAL]';
-    console.log(`🤖 ${modeTag} AUTO-BUY: ${symbol} | score=${scoreResult.score} | ${amountSol} SOL`);
+    log.trade(`${modeTag} AUTO-BUY: ${symbol} | score=${scoreResult.score} | ${amountSol} SOL`);
 
     let result;
     try {
-        result = await pump.executeSwap({
+        const swapOpts = {
             outputMint: mint,
             amountLamports: Math.floor(amountSol * 1e9),
             slippageBps: CONFIG.AUTO_BUY_SLIPPAGE_BPS,
             isSimulation: CONFIG.ENABLE_SIMULATION_MODE,
-        });
+        };
+        if (!CONFIG.ENABLE_SIMULATION_MODE) {
+            swapOpts.priorityMicroLamports = scoreResult.score >= CONFIG.PRIORITY_SCORE_HIGH
+                ? CONFIG.PRIORITY_MICRO_LAMPORTS_HIGH
+                : CONFIG.PRIORITY_MICRO_LAMPORTS_DEFAULT;
+        }
+        result = await pump.executeSwap(swapOpts);
 
         // VALIDASI RESULT
         if (!result || typeof result !== 'object') {
@@ -430,7 +508,7 @@ async function executeAutoBuy(mint, symbol, token, scoreResult) {
             `🔗 <a href="https://solscan.io/tx/${result.txid.slice(0, 100)}">TX</a>`
         );
 
-        console.log(`✅ AUTO-BUY SUCCESS: ${symbol} | ${result.outputAmount.toFixed(0)} tokens`);
+        log.ok(`AUTO-BUY OK: ${symbol} | ${result.outputAmount.toFixed(0)} tokens`);
         return result;
 
     } catch (rawError) {
@@ -452,18 +530,18 @@ async function executeAutoBuy(mint, symbol, token, scoreResult) {
 
         // SPECIAL CASES
         if (errorMsg.includes('GRADUATED')) {
-            console.log(`⏭️ Skip [${symbol}]: graduated to DEX`);
+            log.info(`Skip [${symbol}]: graduated to DEX`);
             return null;
         }
         if (errorMsg.includes('Token tidak terdeteksi')) {
-            console.log(`⏭️ Skip [${symbol}]: RPC delay`);
+            log.info(`Skip [${symbol}]: RPC delay`);
             return null;
         }
 
         // LOGGING - 100% SAFE
-        console.error(`❌ Auto-buy gagal [${symbol}]: ${errorMsg}`);
+        log.err(`Auto-buy gagal [${symbol}]: ${errorMsg}`);
         if (errorLogs.length > 0) {
-            console.error(`📝 Logs:\n${errorLogs.join('\n')}`);
+            log.txLogs(errorLogs.join('\n'));
         }
 
         // NOTIF KE CHANNEL (SAFE)
@@ -499,12 +577,11 @@ async function manualClose(mint) {
         return { ...closed, txid: 'no_token' };
     }
 
-    const result = await pump.executeSell({
-        inputMint:    mint,
-        amountTokens: balance,
+    const result = await executeSellWithDustPasses(mint, balance, {
         slippageBps:  2000,
         isSimulation: pos.isSimulation || CONFIG.ENABLE_SIMULATION_MODE,
-    });
+        priorityMicroLamports: priorityMicroForPos(pos),
+    }, true);
 
     const currentPrice = await pump.getTokenPriceInSol(mint) || pos.entryPriceSol;
     const closed = posTracker.closePosition(mint, {

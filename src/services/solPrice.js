@@ -1,6 +1,7 @@
 'use strict';
 const axios = require('axios');
 const state = require('../config/state');
+const log = require('../utils/logger');
 
 // Coba beberapa sumber secara berurutan
 const PRICE_SOURCES = [
@@ -28,14 +29,14 @@ async function updateSolPrice() {
             const price = source.parse(data);
             if (price && price > 0) {
                 state.setSolPrice(price);
-                console.log(`💰 Harga SOL: $${price.toFixed(2)} (via ${source.name})`);
+                log.price(`SOL $${price.toFixed(2)} (${source.name})`);
                 return; // berhasil, stop
             }
         } catch {
-            console.warn(`⚠️ ${source.name} gagal, mencoba sumber berikutnya...`);
+            log.warn(`Harga SOL: ${source.name} gagal, coba sumber lain…`);
         }
     }
-    console.warn(`⚠️ Semua sumber harga SOL gagal, menggunakan nilai lama ($${state.currentSolPrice.toFixed(2)})`);
+    log.warn(`Semua sumber harga SOL gagal — pakai nilai lama $${state.currentSolPrice.toFixed(2)}`);
 }
 
 function startPriceUpdater(intervalMs = 120_000) {

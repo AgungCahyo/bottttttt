@@ -1,6 +1,7 @@
 'use strict';
 const fs   = require('fs');
 const path = require('path');
+const log  = require('../utils/logger');
 
 // ============================================================
 // FILE CACHE
@@ -14,10 +15,10 @@ function loadCache() {
         if (fs.existsSync(CACHE_FILE)) {
             const data = JSON.parse(fs.readFileSync(CACHE_FILE, 'utf8'));
             sentArticleIds = new Set(data);
-            console.log(`💾 Cache dimuat: ${sentArticleIds.size} ID berita lama.`);
+            log.load(`Cache berita: ${sentArticleIds.size} ID`);
         }
     } catch (err) {
-        console.warn('⚠️ Gagal memuat cache:', err.message);
+        log.warn(`Gagal memuat cache: ${err.message}`);
     }
 }
 
@@ -25,7 +26,7 @@ function saveCache() {
     try {
         fs.writeFileSync(CACHE_FILE, JSON.stringify(Array.from(sentArticleIds)), 'utf8');
     } catch (err) {
-        console.warn('⚠️ Gagal menyimpan cache:', err.message);
+        log.warn(`Gagal menyimpan cache: ${err.message}`);
     }
 }
 

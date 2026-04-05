@@ -7,6 +7,7 @@ const { formatSolanaWebhook }   = require('../utils/formatters');
 const { sendToChannel }         = require('../services/telegram');
 
 const router = express.Router();
+const log = require('../utils/logger');
 
 // ============================================================
 // WEBHOOK SECRET VALIDATOR
@@ -34,7 +35,7 @@ router.post('/solana-webhook', async (req, res) => {
             return res.status(200).send('OK');
         }
 
-        console.log(`⛓️ Menerima ${transactions.length} transaksi Solana...`);
+        log.info(`Solana webhook: ${transactions.length} tx`);
 
         for (const tx of transactions) {
             await sendToChannel(formatSolanaWebhook(tx));
@@ -43,7 +44,7 @@ router.post('/solana-webhook', async (req, res) => {
 
         return res.status(200).send('Webhook received.');
     } catch (err) {
-        console.error('❌ Solana webhook error:', err.message);
+        log.err(`Solana webhook: ${err.message}`);
         return res.status(500).send('Internal Server Error');
     }
 });

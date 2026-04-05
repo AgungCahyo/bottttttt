@@ -8,9 +8,73 @@ const scorer  = require('../trading/signalScorer');
 const { formatEarlySignal, formatCallConfirmed } = require('../utils/formatters');
 const { sendToChannel } = require('./telegram');
 const tradingEngine = require('../trading/tradingEngine');
+const log = require('../utils/logger');
 
 const WS_URL = 'wss://pumpportal.fun/api/data';
 let activeWs = null;
+
+/** ≥ ini: harga tersirat dari trade WS langsung dipakai (realtime). */
+const PUMP_STREAM_STRONG_SOL = 0.03;
+/** Trade lebih kecil: hanya jika masih masuk akal vs mark terakhir (hindari dust). */
+const PUMP_STREAM_WEAK_SOL = 0.012;
+const STREAM_MARK_MIN_RATIO = 0.3;
+const STREAM_MARK_MAX_RATIO = 3.5;
+/** Debounce refresh spot on-chain/API saat trade kecil / tidak terpercaya (ms). */
+const SPOT_REFRESH_DEBOUNCE_MS = 320;
+
+const lastMarkByMint = new Map();
+const spotRefreshTimers = new Map();
+
+function markPlausible(mint, implied) {
+    const prev = lastMarkByMint.get(mint);
+    if (prev == null || !(prev > 0)) return false;
+    const r = implied / prev;
+    return r >= STREAM_MARK_MIN_RATIO && r <= STREAM_MARK_MAX_RATIO;
+}
+
+function scheduleSpotRefresh(mint) {
+    if (spotRefreshTimers.has(mint)) return;
+    const t = setTimeout(() => {
+        spotRefreshTimers.delete(mint);
+        (async () => {
+            try {
+                const pump = require('../trading/pumpClient');
+                const spot = await pump.getSpotSolPerToken(mint);
+                if (spot != null && spot > 0 && Number.isFinite(spot)) {
+                    lastMarkByMint.set(mint, spot);
+                    tradingEngine.handleStreamPrice(mint, spot).catch(() => {});
+                }
+            } catch { /* ignore */ }
+        })();
+    }, SPOT_REFRESH_DEBOUNCE_MS);
+    spotRefreshTimers.set(mint, t);
+}
+
+/** Update harga posisi dari stream — jalan walau token sudah tidak di radar track window. */
+function updatePositionStreamMark(mint, solAmount, tokenAmt) {
+    if (!mint) return;
+
+    if (tokenAmt <= 0 || solAmount <= 0) {
+        scheduleSpotRefresh(mint);
+        return;
+    }
+
+    const implied = solAmount / tokenAmt;
+
+    if (solAmount >= PUMP_STREAM_STRONG_SOL) {
+        lastMarkByMint.set(mint, implied);
+        tradingEngine.handleStreamPrice(mint, implied).catch(() => {});
+        return;
+    }
+
+    if (solAmount >= PUMP_STREAM_WEAK_SOL && markPlausible(mint, implied)) {
+        lastMarkByMint.set(mint, implied);
+        tradingEngine.handleStreamPrice(mint, implied).catch(() => {});
+        return;
+    }
+
+    scheduleSpotRefresh(mint);
+}
 
 // ============================================================
 // TOKEN TRACKING FACTORY
@@ -48,7 +112,7 @@ function calcCurveProgress(volumeSol) {
 // HANDLE NEW TOKEN
 // ============================================================
 function handleNewToken(event, ws) {
-    process.stdout.write('.');
+    process.stdout.write(log.paint(log.C.gray, '.'));
     state.trackedTokens.set(event.mint, createTokenEntry(event));
     ws.send(JSON.stringify({ method: 'subscribeTokenTrade', keys: [event.mint] }));
 
@@ -62,12 +126,18 @@ function handleNewToken(event, ws) {
 // HANDLE TRADE
 // ============================================================
 async function handleTrade(event) {
+    const solAmount = parseFloat(event.solAmount || 0);
+    const tokenAmt  = parseFloat(event.tokenAmount || 0);
+    const trader    = event.traderPublicKey;
+
+    // Posisi terbuka: selalu proses stream (tidak bergantung trackedTokens / window radar).
+    if (event.mint && tradingEngine.posTracker.hasPosition(event.mint)) {
+        updatePositionStreamMark(event.mint, solAmount, tokenAmt);
+    }
+
     const token = state.trackedTokens.get(event.mint);
     if (!token) return;
 
-    const solAmount  = parseFloat(event.solAmount  || 0);
-    const tokenAmt   = parseFloat(event.tokenAmount || 0);
-    const trader     = event.traderPublicKey;
     const timeDiffMs = Date.now() - token.startTime;
 
     token.volumeSol += solAmount;
@@ -112,21 +182,15 @@ async function handleTrade(event) {
 
         const scoreTag = `[${scoreResult.score}/100]`;
         if (scoreResult.shouldBuy) {
-            console.log(`\n🟢 SIGNAL ${scoreTag} AUTO-BUY: ${token.symbol}`);
+            log.signal(`${scoreTag} AUTO-BUY: ${token.symbol}`);
             // Kirim ke trading engine hanya jika lolos filter
             tradingEngine.executeAutoBuy(event.mint, token.symbol, token, scoreResult);
         } else {
             const why = scoreResult.rejects.length > 0
                 ? scoreResult.rejects.join(', ')
                 : `score ${scoreResult.score} < ${scoreResult.minScore}`;
-            console.log(`\n🟡 SIGNAL ${scoreTag} SKIP: ${token.symbol} — ${why}`);
+            log.skip(`${scoreTag} ${token.symbol} — ${why}`);
         }
-    }
-
-    // ─── STREAMING PRICE UPDATE ────────────────────────────────
-    // Jika koin ini sedang kita pegang (posisi terbuka), langsung gas update harga
-    if (tradingEngine.posTracker.hasPosition(event.mint)) {
-        tradingEngine.handleStreamPrice(event.mint, mcapSol / CONFIG.PUMP_TOTAL_SUPPLY);
     }
 }
 
@@ -182,18 +246,18 @@ function formatEarlySignalWithScore(mint, data, mcapSol, curve, scoreResult) {
 // WEBSOCKET INIT
 // ============================================================
 function initPumpRadar() {
-    console.log('📡 Menghubungkan ke Radar Pump.fun...');
+    log.radar('Menghubungkan ke Pump.fun WebSocket…');
     const ws = new WebSocket(WS_URL);
     activeWs = ws;
 
     ws.on('open', () => {
-        console.log('✅ Radar Pump.fun TERKONEKSI!');
+        log.ok('Radar Pump.fun terhubung');
         ws.send(JSON.stringify({ method: 'subscribeNewToken' }));
 
         // Re-subscribe ke posisi terbuka jika ada (setelah restart)
         const openMints = tradingEngine.posTracker.getAllPositions().map(p => p.mint);
         if (openMints.length > 0) {
-            console.log(`📡 Re-subscribing ke ${openMints.length} posisi terbuka...`);
+            log.radar(`Re-subscribe ${openMints.length} posisi terbuka`);
             ws.send(JSON.stringify({ method: 'subscribeTokenTrade', keys: openMints }));
         }
     });
@@ -211,11 +275,11 @@ function initPumpRadar() {
 
     ws.on('close', () => {
         activeWs = null;
-        console.warn('⚠️  Radar terputus. Reconnect dalam 5 detik...');
+        log.radarWarn('Radar terputus — reconnect ~5s');
         setTimeout(initPumpRadar, 5_000);
     });
 
-    ws.on('error', err => console.error('❌ Radar error:', err.message));
+    ws.on('error', err => log.radarErr(err.message));
 }
 
 function subscribeToMint(mint) {
@@ -232,5 +296,17 @@ function unsubscribeFromMint(mint) {
         activeWs.send(JSON.stringify({ method: 'unsubscribeTokenTrade', keys: [mint] }));
     }
 }
+
+const posTracker = require('../trading/positionTracker');
+posTracker.on('opened', (pos) => {
+    if (pos?.mint && pos.entryPriceSol > 0) lastMarkByMint.set(pos.mint, pos.entryPriceSol);
+});
+posTracker.on('closed', (pos) => {
+    if (!pos?.mint) return;
+    lastMarkByMint.delete(pos.mint);
+    const tid = spotRefreshTimers.get(pos.mint);
+    if (tid) clearTimeout(tid);
+    spotRefreshTimers.delete(pos.mint);
+});
 
 module.exports = { initPumpRadar, subscribeToMint, unsubscribeFromMint };

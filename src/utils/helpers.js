@@ -1,5 +1,6 @@
 'use strict';
 const CONFIG = require('../config');
+const log = require('./logger');
 
 // ============================================================
 // HTML ESCAPING
@@ -21,7 +22,7 @@ async function withRetry(fn, label = 'operasi', maxRetries = CONFIG.MAX_RETRIES)
             return await fn();
         } catch (err) {
             const isLast = attempt === maxRetries;
-            console.warn(`⚠️  [${label}] Percobaan ${attempt}/${maxRetries} gagal: ${err.message}`);
+            log.warn(`[${label}] percobaan ${attempt}/${maxRetries} gagal: ${err.message}`);
             if (isLast) throw err;
             await sleep(CONFIG.RETRY_DELAY_MS * attempt);
         }

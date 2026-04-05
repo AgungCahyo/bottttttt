@@ -7,6 +7,7 @@ const riskManager  = require('../risk/riskManager');
 const posTracker   = require('../positionTracker');
 const { sendToChannel } = require('../../services/telegram');
 const { esc } = require('../../utils/helpers');
+const log = require('../../utils/logger');
 
 const DCA_FILE = path.join(__dirname, '../../../trading_dca.json');
 
@@ -24,7 +25,7 @@ function loadDcaPlans() {
         if (fs.existsSync(DCA_FILE)) {
             const arr = JSON.parse(fs.readFileSync(DCA_FILE, 'utf8'));
             dcaPlans = new Map(arr.map(p => [p.id, p]));
-            console.log(`📂 DCA plans dimuat: ${dcaPlans.size} plan.`);
+            log.load(`DCA plans: ${dcaPlans.size}`);
         }
     } catch { /* ignore */ }
 }
@@ -60,7 +61,7 @@ function createDcaPlan({ mint, symbol, totalSol, orders, intervalMinutes, stopLo
 
     dcaPlans.set(id, plan);
     saveDcaPlans();
-    console.log(`📋 DCA Plan dibuat: ${symbol} — ${orders}x ${perOrderSol.toFixed(3)} SOL per ${intervalMinutes} menit`);
+    log.plan(`DCA ${symbol} — ${orders}x ${perOrderSol.toFixed(3)} SOL / ${intervalMinutes} mnt`);
     return plan;
 }
 
@@ -77,7 +78,7 @@ async function executeDcaOrder(plan) {
     });
 
     if (!check.allowed) {
-        console.warn(`⛔ DCA [${plan.symbol}] diblokir: ${check.reason}`);
+        log.dcaWarn(`[${plan.symbol}] diblokir: ${check.reason}`);
         riskManager.recordBlocked();
         return null;
     }
@@ -130,7 +131,7 @@ async function executeDcaOrder(plan) {
         return result;
 
     } catch (err) {
-        console.error(`❌ DCA order gagal [${plan.symbol}]:`, err.message);
+        log.dcaErr(`Order gagal [${plan.symbol}]: ${err.message}`);
         await sendToChannel(`❌ <b>DCA ORDER GAGAL</b>\n🪙 ${esc(plan.symbol)}\n⚠️ ${esc(err.message)}`);
         return null;
     }

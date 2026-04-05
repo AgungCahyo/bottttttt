@@ -14,6 +14,7 @@ const { registerHandlers, registerFallbackHandler, isAdmin, requireAdmin } = req
 const { registerTradingHandlers } = require('./src/handlers/tradingCommands');
 const tradingEngine = require('./src/trading/tradingEngine');
 const routes = require('./src/handlers/routes');
+const log = require('./src/utils/logger');
 
 const bot = new Telegraf(CONFIG.BOT_TOKEN);
 const app = express();
@@ -29,72 +30,71 @@ registerFallbackHandler(bot);
 // 🛡️ BULLETPROOF ERROR HANDLERS
 process.on('uncaughtException', (err) => {
     const safeMsg = err?.message || 'Unknown crash';
-    console.error('💥 CRASH:', safeMsg);
-    console.error('💥 Stack:', err?.stack || 'No stack');
+    log.crash(safeMsg);
+    log.crash(err?.stack || 'No stack');
     // JANGAN process.exit() - biarkan server jalan
 });
 
 process.on('unhandledRejection', (reason, promise) => {
     const safeMsg = reason?.message || reason?.toString?.() || 'Unknown promise rejection';
-    console.error('💥 PROMISE REJECT:', safeMsg);
-    console.error('💥 Promise:', promise);
+    log.crash(`promise reject: ${safeMsg}`);
+    log.dim(String(promise));
     // JANGAN process.exit()
 });
 
 async function start() {
-    console.log('🚀 Memulai bot...');
+    log.boot('Memulai bot…');
     try {
         state.loadCache();
 
-        console.log('--- INISIALISASI TRADING ENGINE ---');
+        log.section('INISIALISASI TRADING ENGINE');
         await tradingEngine.init({
             rpcUrl:           CONFIG.SOLANA_RPC_URL,
             privateKeyBase58: CONFIG.PRIVATE_KEY_BASE58,
         });
-        console.log('✅ Trading Engine AKTIF!');
+        log.engine('Trading engine aktif');
 
         startPriceUpdater(120_000);
 
         if (CONFIG.ENABLE_PUMP_RADAR) {
-            console.log('📡 Menghubungkan ke Radar Pump.fun...');
             initPumpRadar();
         } else {
-            console.log('⛔ Pump Radar dinonaktifkan.');
+            log.warn('Pump radar dinonaktifkan');
         }
 
         if (CONFIG.ENABLE_NEWS_POLLING && CONFIG.NEWSDATA_API_KEY) {
             startNewsPolling();
         } else {
-            console.log('⛔ News polling dinonaktifkan.');
+            log.warn('News polling dinonaktifkan');
         }
 
-        console.log('--- INISIALISASI TELEGRAM ---');
+        log.section('INISIALISASI TELEGRAM');
         await bot.telegram.deleteWebhook({ drop_pending_updates: true }).catch(() => {});
         await bot.launch();
-        console.log('✅ Bot Telegram AKTIF!\n');
+        log.bots('Bot Telegram aktif\n');
 
     } catch (err) {
         const safeMsg = err?.message || 'Startup failed';
-        console.error('💥 GAGAL startup:', safeMsg);
-        console.error('💥 Detail:', err);
+        log.err(`Gagal startup: ${safeMsg}`);
+        log.err(String(err));
         process.exit(1);
     }
 }
 
 app.listen(CONFIG.PORT, () => {
-    console.log(`📡 Server di port ${CONFIG.PORT}`);
+    log.info(`HTTP server port ${CONFIG.PORT}`);
     start();
 });
 
 // 🛡️ SAFE SHUTDOWN
 ['SIGINT', 'SIGTERM'].forEach(sig => {
     process.once(sig, async () => {
-        console.log(`\n🛑 ${sig} — shutdown...`);
+        log.stop(`${sig} — shutdown…`);
         try {
             await tradingEngine.stop?.();
             await bot.stop(sig);
-        } catch(e) {
-            console.log('⚠️ Shutdown warning:', e.message);
+        } catch (e) {
+            log.warn(`Shutdown: ${e.message}`);
         }
         process.exit(0);
     });

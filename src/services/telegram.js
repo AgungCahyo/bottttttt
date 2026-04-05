@@ -1,5 +1,6 @@
 'use strict';
 const CONFIG = require('../config');
+const log = require('../utils/logger');
 
 let _bot = null; // set saat init
 
@@ -13,11 +14,11 @@ function init(botInstance) {
 // ============================================================
 async function sendToChannel(html, keyboard = null) {
     if (!CONFIG.TELEGRAM_CHANNEL_ID) {
-        console.warn('⚠️  Gagal kirim: TELEGRAM_CHANNEL_ID tidak ada di .env');
+        log.warn('Gagal kirim: TELEGRAM_CHANNEL_ID tidak ada di .env');
         return null;
     }
     if (!_bot) {
-        console.warn('⚠️  Gagal kirim: bot belum diinisialisasi.');
+        log.warn('Gagal kirim: bot belum diinisialisasi');
         return null;
     }
 
@@ -26,11 +27,11 @@ async function sendToChannel(html, keyboard = null) {
         if (keyboard) options.reply_markup = keyboard.reply_markup;
 
         const result = await _bot.telegram.sendMessage(CONFIG.TELEGRAM_CHANNEL_ID, html, options);
-        console.log(`✅ Terkirim — msg_id=${result.message_id} chat=${result.chat.id} (${result.chat.username || 'N/A'})`);
+        log.sent(`msg_id=${result.message_id} chat=${result.chat.id} (${result.chat.username || 'N/A'})`);
         return result;
     } catch (err) {
-        console.error('❌ GAGAL kirim ke Telegram:', err.message);
-        if (err.description) console.error('   Detail:', err.description);
+        log.telegramErr(err.message);
+        if (err.description) log.telegramErr(String(err.description));
         return null;
     }
 }

@@ -2,6 +2,7 @@
 const fs   = require('fs');
 const path = require('path');
 const CONFIG = require('../../config');
+const log  = require('../../utils/logger');
 
 const RISK_FILE = path.join(__dirname, '../../../trading_risk.json');
 
@@ -17,7 +18,7 @@ const DEFAULT_RISK = {
 
     // Harian
     dailyLossLimitSol:   2.0,
-    maxTradesPerDay:     20,
+    maxTradesPerDay:     50,
 
     // Token
     whitelistEnabled:    false,
@@ -49,7 +50,7 @@ function today() {
 function checkDayReset() {
     if (dailyStats.date !== today()) {
         dailyStats = { date: today(), totalLossSol: 0, totalProfitSol: 0, tradeCount: 0, blockedCount: 0 };
-        console.log('📅 Daily stats direset untuk hari baru.');
+        log.risk('Daily stats direset (hari baru)');
     }
 }
 
@@ -63,16 +64,16 @@ function loadRiskConfig() {
         if (fs.existsSync(RISK_FILE)) {
             const saved = JSON.parse(fs.readFileSync(RISK_FILE, 'utf8'));
             riskConfig = { ...DEFAULT_RISK, ...saved };
-            console.log('🛡️  Risk config dimuat dari file.');
+            log.risk('Config dimuat dari file');
         }
     } catch (err) {
-        console.warn('⚠️ Gagal load risk config:', err.message);
+        log.riskWarn(`Gagal load risk config: ${err.message}`);
     }
     // Samakan min buy dengan AUTO_BUY: file lama sering punya min 0.01 padahal .env 0.001
     const auto = CONFIG.AUTO_BUY_AMOUNT_SOL;
     if (Number.isFinite(auto) && auto > 0 && riskConfig.minBuyAmountSol > auto) {
         riskConfig.minBuyAmountSol = auto;
-        console.log(`🛡️  minBuyAmountSol diselaraskan ke AUTO_BUY (${auto} SOL).`);
+        log.risk(`minBuyAmountSol diselaraskan ke AUTO_BUY (${auto} SOL)`);
     }
 }
 
@@ -80,7 +81,7 @@ function saveRiskConfig() {
     try {
         fs.writeFileSync(RISK_FILE, JSON.stringify(riskConfig, null, 2), 'utf8');
     } catch (err) {
-        console.warn('⚠️ Gagal simpan risk config:', err.message);
+        log.riskWarn(`Gagal simpan risk config: ${err.message}`);
     }
 }
 

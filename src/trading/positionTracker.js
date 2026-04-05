@@ -2,6 +2,7 @@
 const fs   = require('fs');
 const path = require('path');
 const EventEmitter = require('events');
+const log  = require('../utils/logger');
 
 const POSITIONS_FILE = path.join(__dirname, '../../../trading_positions.json');
 
@@ -20,10 +21,10 @@ function loadPositions() {
         if (fs.existsSync(POSITIONS_FILE)) {
             const arr = JSON.parse(fs.readFileSync(POSITIONS_FILE, 'utf8'));
             positions = new Map(arr.map(p => [p.mint, p]));
-            console.log(`📂 Posisi dimuat: ${positions.size} posisi terbuka.`);
+            log.load(`Posisi dimuat: ${positions.size} terbuka`);
         }
     } catch (err) {
-        console.warn('⚠️ Gagal load posisi:', err.message);
+        log.warn(`Gagal load posisi: ${err.message}`);
     }
 }
 
@@ -31,7 +32,7 @@ function savePositions() {
     try {
         fs.writeFileSync(POSITIONS_FILE, JSON.stringify([...positions.values()], null, 2), 'utf8');
     } catch (err) {
-        console.warn('⚠️ Gagal simpan posisi:', err.message);
+        log.warn(`Gagal simpan posisi: ${err.message}`);
     }
 }
 
@@ -47,7 +48,7 @@ function openPosition(data) {
         status: 'open',
     });
     savePositions();
-    console.log(`📈 Posisi dibuka: ${data.symbol} @ ${data.entryPriceSol?.toFixed(8)} SOL`);
+    log.open(`${data.symbol} @ ${data.entryPriceSol?.toFixed(8)} SOL`);
     emitter.emit('opened', data);
 }
 
@@ -70,7 +71,10 @@ function closePosition(mint, { exitPriceSol, reason = 'manual', txid = null }) {
     positions.delete(mint);
     savePositions();
 
-    console.log(`📉 Posisi ditutup: ${pos.symbol} | PnL: ${pnlSol >= 0 ? '+' : ''}${pnlSol.toFixed(4)} SOL (${pnlPct.toFixed(1)}%) — ${reason}`);
+    log.close(
+        `${pos.symbol} | PnL: ${pnlSol >= 0 ? '+' : ''}${pnlSol.toFixed(4)} SOL (${pnlPct.toFixed(1)}%) — ${reason}`,
+        pnlSol < 0
+    );
     emitter.emit('closed', closed);
     return closed;
 }

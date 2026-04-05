@@ -7,6 +7,7 @@ const riskManager = require('../risk/riskManager');
 const posTracker  = require('../positionTracker');
 const { sendToChannel } = require('../../services/telegram');
 const { esc } = require('../../utils/helpers');
+const log = require('../../utils/logger');
 
 const GRID_FILE = path.join(__dirname, '../../../trading_grid.json');
 
@@ -21,7 +22,7 @@ function loadGridPlans() {
         if (fs.existsSync(GRID_FILE)) {
             const arr = JSON.parse(fs.readFileSync(GRID_FILE, 'utf8'));
             gridPlans = new Map(arr.map(p => [p.id, p]));
-            console.log(`📂 Grid plans dimuat: ${gridPlans.size} plan.`);
+            log.load(`Grid plans: ${gridPlans.size}`);
         }
     } catch { /* ignore */ }
 }
@@ -70,7 +71,7 @@ function createGridPlan({ mint, symbol, totalSol, lowerPrice, upperPrice, gridCo
 
     gridPlans.set(id, plan);
     saveGridPlans();
-    console.log(`📋 Grid Plan dibuat: ${symbol} — ${gridCount} grid [${lowerPrice.toFixed(8)} – ${upperPrice.toFixed(8)} SOL]`);
+    log.plan(`Grid ${symbol} — ${gridCount} level [${lowerPrice.toFixed(8)} – ${upperPrice.toFixed(8)} SOL]`);
     return plan;
 }
 
@@ -127,7 +128,7 @@ async function processGridTick(plan, currentPriceSol) {
                     `🔗 <a href="https://solscan.io/tx/${result.txid}">Solscan</a>`
                 );
             } catch (err) {
-                console.error(`❌ Grid buy gagal:`, err.message);
+                log.gridErr(`Grid buy: ${err.message}`);
             }
         }
 
@@ -163,7 +164,7 @@ async function processGridTick(plan, currentPriceSol) {
                     `🔗 <a href="https://solscan.io/tx/${result.txid}">Solscan</a>`
                 );
             } catch (err) {
-                console.error(`❌ Grid sell gagal:`, err.message);
+                log.gridErr(`Grid sell: ${err.message}`);
             }
         }
     }

@@ -1,5 +1,6 @@
 'use strict';
 require('dotenv').config();
+const log = require('../utils/logger');
 
 // ============================================================
 // VALIDASI ENVIRONMENT
@@ -7,7 +8,7 @@ require('dotenv').config();
 const REQUIRED_ENV = ['TELEGRAM_BOT_TOKEN', 'TELEGRAM_CHANNEL_ID'];
 const missingEnv = REQUIRED_ENV.filter(key => !process.env[key]);
 if (missingEnv.length > 0) {
-    console.error(`❌ ERROR: Variable berikut belum diisi di .env:\n  ${missingEnv.join('\n  ')}`);
+    log.err(`Variable .env belum diisi:\n  ${missingEnv.join('\n  ')}`);
     process.exit(1);
 }
 
@@ -49,22 +50,43 @@ const CONFIG = {
     /** Skor minimum radar untuk auto-buy (55 = longgar, 70+ = lebih selektif, bukan jaminan win) */
     SIGNAL_MIN_SCORE:       parseInt(process.env.SIGNAL_MIN_SCORE || '55', 10),
 
+    /** Sim: potong quote tambahan (BPS) agar fill tidak terlalu optimistis vs real (slippage + buffer) */
+    SIM_EXTRA_IMPACT_BPS:   parseInt(process.env.SIM_EXTRA_IMPACT_BPS || '350', 10),
+
+    /** Stream: min sampel harga sebelum SL dari WebSocket; pakai rata-rata window (kurangi wick palsu) */
+    STREAM_SL_AVG_WINDOW:   Math.min(5, Math.max(2, parseInt(process.env.STREAM_SL_AVG_WINDOW || '3', 10))),
+    STREAM_SL_MIN_SAMPLES: Math.min(5, Math.max(2, parseInt(process.env.STREAM_SL_MIN_SAMPLES || '2', 10))),
+
+    /** Real: priority fee (microLamports per CU) — naik jika score entry ≥ PRIORITY_SCORE_HIGH */
+    PRIORITY_SCORE_HIGH:         parseInt(process.env.PRIORITY_SCORE_HIGH || '80', 10),
+    PRIORITY_MICRO_LAMPORTS_DEFAULT: parseInt(process.env.PRIORITY_MICRO_LAMPORTS_DEFAULT || '1000000', 10),
+    PRIORITY_MICRO_LAMPORTS_HIGH:    parseInt(process.env.PRIORITY_MICRO_LAMPORTS_HIGH || '8000000', 10),
+
+    /** Real: setelah jual penuh, coba lagi jika sisa token > ambang (pembulatan / dust) */
+    TOKEN_DUST_THRESHOLD_UI: parseFloat(process.env.TOKEN_DUST_THRESHOLD_UI || '0.00001'),
+    SELL_DUST_EXTRA_ROUNDS:  parseInt(process.env.SELL_DUST_EXTRA_ROUNDS || '2', 10),
+
     // Feature Flags
     ENABLE_SOLANA_STREAM: process.env.ENABLE_SOLANA_STREAM === 'true',
     ENABLE_NEWS_POLLING:  process.env.ENABLE_NEWS_POLLING  === 'true',
     ENABLE_PUMP_RADAR:    process.env.ENABLE_PUMP_RADAR    !== 'false',
 };
 
-// Print summary
-console.log('🔧 Konfigurasi:');
-console.log(`   Channel       : ${CONFIG.TELEGRAM_CHANNEL_ID}`);
-console.log(`   Port          : ${CONFIG.PORT}`);
-console.log(`   Simulation    : ${CONFIG.ENABLE_SIMULATION_MODE ? '🛡️ AKTIF (Tanpa SOL Asli)' : '💸 NONAKTIF (Menggunakan SOL Asli!)'}`);
-console.log(`   Auto-Buy      : ${CONFIG.AUTO_BUY_AMOUNT_SOL} SOL (Slippage: ${CONFIG.AUTO_BUY_SLIPPAGE_BPS / 100}%)`);
-console.log(`   Min skor buy  : ${CONFIG.SIGNAL_MIN_SCORE}/100`);
-console.log(`   News polling  : ${CONFIG.ENABLE_NEWS_POLLING ? `✅ setiap ${CONFIG.NEWS_INTERVAL_MS / 60_000} mnt` : '⛔ nonaktif'}`);
-console.log(`   Pump radar    : ${CONFIG.ENABLE_PUMP_RADAR   ? '✅' : '⛔ nonaktif'}`);
-console.log(`   Solana stream : ${CONFIG.ENABLE_SOLANA_STREAM ? '✅' : '⛔ nonaktif'}`);
-console.log(`   NewsData API  : ${CONFIG.NEWSDATA_API_KEY    ? '✅' : '⚠️  tidak dikonfigurasi'}`);
+// Ringkasan boot (warna via logger)
+log.cfgTitle();
+log.cfgRow('Channel', CONFIG.TELEGRAM_CHANNEL_ID);
+log.cfgRow('Port', String(CONFIG.PORT));
+log.cfgRow('Simulation', CONFIG.ENABLE_SIMULATION_MODE ? log.stateSim() : log.stateLive());
+log.cfgRow('Auto-Buy', `${CONFIG.AUTO_BUY_AMOUNT_SOL} SOL (slippage ${CONFIG.AUTO_BUY_SLIPPAGE_BPS / 100}%)`);
+log.cfgRow('Min skor buy', `${CONFIG.SIGNAL_MIN_SCORE}/100`);
+log.cfgRow(
+    'News polling',
+    CONFIG.ENABLE_NEWS_POLLING
+        ? `${log.stateOn()} setiap ${CONFIG.NEWS_INTERVAL_MS / 60_000} mnt`
+        : log.stateOff()
+);
+log.cfgRow('Pump radar', CONFIG.ENABLE_PUMP_RADAR ? log.stateOn() : log.stateOff());
+log.cfgRow('Solana stream', CONFIG.ENABLE_SOLANA_STREAM ? log.stateOn() : log.stateOff());
+log.cfgRow('NewsData API', CONFIG.NEWSDATA_API_KEY ? log.stateOn() : log.stateUnknown());
 
 module.exports = CONFIG;

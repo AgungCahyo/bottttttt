@@ -5,6 +5,7 @@ const state   = require('../config/state');
 const { withRetry, sleep } = require('../utils/helpers');
 const { formatNews }       = require('../utils/formatters');
 const { sendToChannel }    = require('./telegram');
+const log = require('../utils/logger');
 
 // ============================================================
 // POLLING BERITA — NewsData.io
@@ -13,16 +14,16 @@ const { sendToChannel }    = require('./telegram');
 // ============================================================
 async function fetchCryptoNews() {
     if (!CONFIG.NEWSDATA_API_KEY) {
-        console.warn('⚠️  NEWSDATA_API_KEY tidak diisi, polling dilewati.');
+        log.warn('NEWSDATA_API_KEY tidak diisi — polling dilewati');
         return;
     }
     if (!state.isPollingActive) {
-        console.log('⏸️  Polling di-pause.');
+        log.news('Polling di-pause');
         return;
     }
 
     try {
-        console.log('🔍 Mengecek berita terbaru dari NewsData.io...');
+        log.news('Mengecek NewsData.io…');
 
         const { data } = await withRetry(
             () => axios.get('https://newsdata.io/api/1/news', {
@@ -38,7 +39,7 @@ async function fetchCryptoNews() {
         );
 
         if (data.status !== 'success') {
-            console.error('❌ API NewsData.io error:', data.message || JSON.stringify(data));
+            log.newsErr(`API NewsData.io: ${data.message || JSON.stringify(data)}`);
             return;
         }
 
@@ -46,16 +47,16 @@ async function fetchCryptoNews() {
         const newArticles = articles.filter(a => a.article_id && !state.hasSentId(a.article_id));
 
         if (newArticles.length === 0) {
-            console.log('ℹ️  Semua berita di halaman depan sudah pernah dikirim.');
+            log.news('Tidak ada berita baru (semua sudah pernah dikirim)');
             return;
         }
 
-        console.log(`📰 Menemukan ${newArticles.length} berita baru.`);
+        log.news(`${newArticles.length} berita baru`);
 
         // Pertama kali jalan: jangan spam, hanya kirim 2 terbaru
         const isFirstRun = state.cacheSize() === 0;
         if (isFirstRun) {
-            console.log('🆕 Inisialisasi pertama: tandai semua, kirim 2 terbaru.');
+            log.news('Init pertama: tandai cache, kirim 2 terbaru');
             articles.forEach(a => state.addSentId(a.article_id));
         }
 
@@ -73,10 +74,10 @@ async function fetchCryptoNews() {
         state.saveCache();
         state.trimCache(1_000);
 
-        console.log(`✅ Berita selesai. Dikirim: ${toSend.length}`);
+        log.ok(`Berita selesai — dikirim: ${toSend.length}`);
 
     } catch (err) {
-        console.error('❌ fetchCryptoNews error:', err.message);
+        log.newsErr(`fetchCryptoNews: ${err.message}`);
     }
 }
 
@@ -86,7 +87,7 @@ async function fetchCryptoNews() {
 function startNewsPolling() {
     fetchCryptoNews();
     setInterval(fetchCryptoNews, CONFIG.NEWS_INTERVAL_MS);
-    console.log(`📰 News polling aktif (setiap ${CONFIG.NEWS_INTERVAL_MS / 60_000} menit)`);
+    log.news(`Polling aktif setiap ${CONFIG.NEWS_INTERVAL_MS / 60_000} menit`);
 }
 
 module.exports = { fetchCryptoNews, startNewsPolling };
