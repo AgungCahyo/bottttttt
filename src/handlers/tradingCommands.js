@@ -64,6 +64,57 @@ function registerTradingHandlers(bot, isAdmin, requireAdmin) {
         }
     });
 
+    // ─── /reset_daily — reset batas trade harian ─────────────
+    bot.command('reset_daily', requireAdmin, ctx => {
+        try {
+            const prev = engine.riskManager.resetDailyStats();
+            return ctx.reply(
+                `✅ <b>Daily stats direset</b>\n\n` +
+                `<b>Sebelumnya:</b>\n` +
+                `  Trades   : ${prev.tradeCount}\n` +
+                `  Loss     : ${prev.totalLossSol.toFixed(4)} SOL\n` +
+                `  Profit   : ${prev.totalProfitSol.toFixed(4)} SOL\n` +
+                `  Diblokir : ${prev.blockedCount}x\n\n` +
+                `Semua counter kini nol. Bot siap trading lagi hari ini.`,
+                { parse_mode: 'HTML' }
+            );
+        } catch (err) {
+            return ctx.reply(`❌ Gagal: ${err.message}`);
+        }
+    });
+
+    // ─── /alert_config — lihat & ubah flag notifikasi ────────
+    bot.command('alert_config', async ctx => {
+        const CONFIG = require('../config');
+        const args   = ctx.message.text.split(' ').slice(1);
+
+        // Tanpa argumen: tampilkan status saat ini
+        if (args.length === 0) {
+            return ctx.reply(
+                `<b>🔔 Konfigurasi Notifikasi Channel</b>\n` +
+                `━━━━━━━━━━━━━━━━━━━━━\n` +
+                `Signal alerts (early/call) : ${CONFIG.ENABLE_SIGNAL_ALERTS  ? '✅ ON' : '⛔ OFF'}\n` +
+                `Profit alerts (trail/TP)   : ${CONFIG.ENABLE_PROFIT_ALERTS  ? '✅ ON' : '⛔ OFF'}\n` +
+                `Stop-loss alerts           : ${CONFIG.ENABLE_STOPLOSS_ALERTS ? '✅ ON' : '⛔ OFF'}\n` +
+                `Buy alerts                 : ${CONFIG.ENABLE_BUY_ALERTS     ? '✅ ON' : '⛔ OFF'}\n\n` +
+                `<i>Ubah via .env lalu restart bot.\n` +
+                `Key: ENABLE_SIGNAL_ALERTS, ENABLE_PROFIT_ALERTS,\n` +
+                `     ENABLE_STOPLOSS_ALERTS, ENABLE_BUY_ALERTS</i>`,
+                { parse_mode: 'HTML' }
+            );
+        }
+
+        return ctx.reply(
+            `ℹ️ Flag notifikasi hanya bisa diubah via <b>.env</b> lalu restart bot.\n\n` +
+            `Key yang tersedia:\n` +
+            `<code>ENABLE_SIGNAL_ALERTS=true/false</code>\n` +
+            `<code>ENABLE_PROFIT_ALERTS=true/false</code>\n` +
+            `<code>ENABLE_STOPLOSS_ALERTS=true/false</code>\n` +
+            `<code>ENABLE_BUY_ALERTS=true/false</code>`,
+            { parse_mode: 'HTML' }
+        );
+    });
+
     // ─── /clear_sim — hapus semua posisi simulasi ─────────────
     bot.command('clear_sim', requireAdmin, ctx => {
         const count = engine.clearSimPositions();
@@ -229,7 +280,8 @@ function registerTradingHandlers(bot, isAdmin, requireAdmin) {
             `Max price impact : ${r.maxPriceImpactPct}%\n` +
             `Slippage default : ${r.defaultSlippageBps / 100}%\n` +
             `Whitelist        : ${r.whitelistEnabled ? `✅ (${r.whitelist.length} token)` : '⛔ nonaktif'}\n\n` +
-            `Ubah: <code>/risk_set &lt;key&gt; &lt;value&gt;</code>`,
+            `Ubah: <code>/risk_set &lt;key&gt; &lt;value&gt;</code>\n` +
+            `Reset harian: <code>/reset_daily</code>`,
             { parse_mode: 'HTML' }
         );
     });
@@ -245,11 +297,14 @@ function registerTradingHandlers(bot, isAdmin, requireAdmin) {
             );
 
         const [key, rawVal] = parts;
-        const ALLOWED = ['maxBuyAmountSol','minBuyAmountSol','dailyLossLimitSol','maxTradesPerDay',
-                         'maxLossPerTradePct','maxPriceImpactPct','defaultSlippageBps','whitelistEnabled'];
+        const ALLOWED = [
+            'maxBuyAmountSol', 'minBuyAmountSol', 'dailyLossLimitSol',
+            'maxTradesPerDay', 'maxLossPerTradePct', 'maxPriceImpactPct',
+            'defaultSlippageBps', 'whitelistEnabled',
+        ];
 
         if (!ALLOWED.includes(key))
-            return ctx.reply(`❌ Key tidak valid.`);
+            return ctx.reply(`❌ Key tidak valid. Pilihan: ${ALLOWED.join(', ')}`);
 
         const value = key === 'whitelistEnabled' ? rawVal === 'true' : parseFloat(rawVal);
         if (isNaN(value) && key !== 'whitelistEnabled')

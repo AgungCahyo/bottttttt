@@ -5,7 +5,6 @@ const { Markup } = require('telegraf');
 const CONFIG  = require('../config');
 const state   = require('../config/state');
 const scorer  = require('../trading/signalScorer');
-const { formatEarlySignal, formatCallConfirmed } = require('../utils/formatters');
 const { sendToChannel } = require('./telegram');
 const tradingEngine = require('../trading/tradingEngine');
 const log = require('../utils/logger');
@@ -13,16 +12,13 @@ const log = require('../utils/logger');
 const WS_URL = 'wss://pumpportal.fun/api/data';
 let activeWs = null;
 
-/** ≥ ini: harga tersirat dari trade WS langsung dipakai (realtime). */
 const PUMP_STREAM_STRONG_SOL = 0.03;
-/** Trade lebih kecil: hanya jika masih masuk akal vs mark terakhir (hindari dust). */
-const PUMP_STREAM_WEAK_SOL = 0.012;
-const STREAM_MARK_MIN_RATIO = 0.3;
-const STREAM_MARK_MAX_RATIO = 3.5;
-/** Debounce refresh spot on-chain/API saat trade kecil / tidak terpercaya (ms). */
+const PUMP_STREAM_WEAK_SOL   = 0.012;
+const STREAM_MARK_MIN_RATIO  = 0.3;
+const STREAM_MARK_MAX_RATIO  = 3.5;
 const SPOT_REFRESH_DEBOUNCE_MS = 320;
 
-const lastMarkByMint = new Map();
+const lastMarkByMint    = new Map();
 const spotRefreshTimers = new Map();
 
 function markPlausible(mint, implied) {
@@ -50,7 +46,6 @@ function scheduleSpotRefresh(mint) {
     spotRefreshTimers.set(mint, t);
 }
 
-/** Update harga posisi dari stream — jalan walau token sudah tidak di radar track window. */
 function updatePositionStreamMark(mint, solAmount, tokenAmt) {
     if (!mint) return;
 
@@ -81,21 +76,21 @@ function updatePositionStreamMark(mint, solAmount, tokenAmt) {
 // ============================================================
 function createTokenEntry(event) {
     return {
-        symbol:       event.symbol || '???',
-        name:         event.name   || 'Unknown',
-        dev:          event.traderPublicKey || 'unknown',
-        startTime:    Date.now(),
-        volumeSol:    0,
-        buyers:       new Set(),
-        buys:         0,
-        sells:        0,
-        whales:       0,
-        maxWhaleBuy:  0,
-        isAlerted:    false,
-        isDevSold:    false,
-        isBundled:    false,
+        symbol:      event.symbol || '???',
+        name:        event.name   || 'Unknown',
+        dev:         event.traderPublicKey || 'unknown',
+        startTime:   Date.now(),
+        volumeSol:   0,
+        buyers:      new Set(),
+        buys:        0,
+        sells:       0,
+        whales:      0,
+        maxWhaleBuy: 0,
+        isAlerted:   false,
+        isDevSold:   false,
+        isBundled:   false,
         alertMCapSol: 0,
-        milestones:   new Set(),
+        milestones:  new Set(),
     };
 }
 
@@ -130,7 +125,6 @@ async function handleTrade(event) {
     const tokenAmt  = parseFloat(event.tokenAmount || 0);
     const trader    = event.traderPublicKey;
 
-    // Posisi terbuka: selalu proses stream (tidak bergantung trackedTokens / window radar).
     if (event.mint && tradingEngine.posTracker.hasPosition(event.mint)) {
         updatePositionStreamMark(event.mint, solAmount, tokenAmt);
     }
@@ -165,25 +159,25 @@ async function handleTrade(event) {
         token.volumeSol   >= CONFIG.PUMP_MIN_VOLUME_SOL &&
         token.buyers.size >= CONFIG.PUMP_MIN_BUYERS)
     {
-        // Evaluasi dengan scorer
         const scoreResult = scorer.evaluate(token);
 
         token.isAlerted    = true;
         token.alertMCapSol = mcapSol;
         state.stats.moonerAlertCount++;
 
-        // Format pesan signal dengan info skor
-        const message  = formatEarlySignalWithScore(event.mint, token, mcapSol, curve, scoreResult);
-        const keyboard = Markup.inlineKeyboard([
-            [Markup.button.url('Beli di Axiom', `https://axiom.trade/t/${event.mint}`)],
-            [Markup.button.url('Analisa di Photon', `https://photon-sol.tinyastro.io/en/lp/${event.mint}`)],
-        ]);
-        await sendToChannel(message, keyboard);
+        // ── Kirim ke channel HANYA jika flag aktif ──────────────
+        if (CONFIG.ENABLE_SIGNAL_ALERTS) {
+            const message  = formatEarlySignalWithScore(event.mint, token, mcapSol, curve, scoreResult);
+            const keyboard = Markup.inlineKeyboard([
+                [Markup.button.url('Beli di Axiom', `https://axiom.trade/t/${event.mint}`)],
+                [Markup.button.url('Analisa di Photon', `https://photon-sol.tinyastro.io/en/lp/${event.mint}`)],
+            ]);
+            await sendToChannel(message, keyboard);
+        }
 
         const scoreTag = `[${scoreResult.score}/100]`;
         if (scoreResult.shouldBuy) {
             log.signal(`${scoreTag} AUTO-BUY: ${token.symbol}`);
-            // Kirim ke trading engine hanya jika lolos filter
             tradingEngine.executeAutoBuy(event.mint, token.symbol, token, scoreResult);
         } else {
             const why = scoreResult.rejects.length > 0
@@ -191,34 +185,71 @@ async function handleTrade(event) {
                 : `score ${scoreResult.score} < ${scoreResult.minScore}`;
             log.skip(`${scoreTag} ${token.symbol} — ${why}`);
         }
+
+        return; // tidak perlu cek call confirmed pada tick yang sama
+    }
+
+    // ─── CALL CONFIRMED (profit milestone) ────────────────────
+    if (token.isAlerted && token.alertMCapSol > 0 && mcapSol > 0) {
+        const multiplier      = mcapSol / token.alertMCapSol;
+        const wholeMultiplier = Math.floor(multiplier);
+
+        if (wholeMultiplier >= 2 && !token.milestones.has(wholeMultiplier)) {
+            token.milestones.add(wholeMultiplier);
+
+            // ── Kirim hanya jika flag sinyal aktif ─────────────
+            if (CONFIG.ENABLE_SIGNAL_ALERTS) {
+                const { esc } = require('../utils/helpers');
+                const solPrice    = state.currentSolPrice;
+                const percent     = ((multiplier - 1) * 100).toFixed(0);
+                const currentUsdM = (mcapSol * solPrice).toLocaleString(undefined, { maximumFractionDigits: 0 });
+                const alertUsdM   = (token.alertMCapSol * solPrice).toLocaleString(undefined, { maximumFractionDigits: 0 });
+
+                const msg =
+                    `🔥 <b>${wholeMultiplier}x CALL CONFIRMED (+${percent}%)</b>\n` +
+                    `━━━━━━━━━━━━━━━━━━━━━\n` +
+                    `🚀 <b>${esc(token.name)} ($${esc(token.symbol)})</b>\n\n` +
+                    `<b>Gain:</b> +${percent}% since alert (${multiplier.toFixed(1)}x)\n` +
+                    `<b>MCap now:</b> $${currentUsdM}\n` +
+                    `<b>MCap at alert:</b> $${alertUsdM}\n` +
+                    `<b>Curve:</b> ${curve}% | <b>Volume:</b> ${token.volumeSol.toFixed(1)} SOL\n\n` +
+                    `📍 <b>CA:</b> <code>${event.mint}</code>\n` +
+                    `━━━━━━━━━━━━━━━━━━━━━\n` +
+                    `<a href="https://pump.fun/${event.mint}">pump.fun</a> | <a href="https://solscan.io/token/${event.mint}">Solscan</a>`;
+
+                const keyboard = Markup.inlineKeyboard([
+                    [Markup.button.url('💰 Take Profit (Axiom)', `https://axiom.trade/t/${event.mint}`)],
+                    [Markup.button.url('🔭 Photon', `https://photon-sol.tinyastro.io/en/lp/${event.mint}`)],
+                ]);
+                await sendToChannel(msg, keyboard);
+            }
+
+            log.signal(`PROFIT: ${token.symbol} ${wholeMultiplier}x`);
+        }
     }
 }
 
 // ============================================================
-// FORMAT SIGNAL + SKOR (Extended dari formatters.js)
+// FORMAT EARLY SIGNAL + SKOR
 // ============================================================
 function formatEarlySignalWithScore(mint, data, mcapSol, curve, scoreResult) {
     const { esc } = require('../utils/helpers');
-    const solPrice    = state.currentSolPrice;
-    const usdMCap     = (mcapSol * solPrice).toLocaleString(undefined, { maximumFractionDigits: 0 });
-    const usdVolume   = (data.volumeSol * solPrice).toLocaleString(undefined, { maximumFractionDigits: 0 });
+    const solPrice  = state.currentSolPrice;
+    const usdMCap   = (mcapSol * solPrice).toLocaleString(undefined, { maximumFractionDigits: 0 });
+    const usdVolume = (data.volumeSol * solPrice).toLocaleString(undefined, { maximumFractionDigits: 0 });
 
-    // Bar visual skor
     const filled  = Math.round(scoreResult.score / 10);
     const empty   = 10 - filled;
     const bar     = '█'.repeat(filled) + '░'.repeat(empty);
 
-    // Rating label
     const rating  = scoreResult.score >= 75 ? '🔥 STRONG'  :
                     scoreResult.score >= 55 ? '✅ GOOD'     :
                     scoreResult.score >= 35 ? '⚠️ WEAK'    : '❌ POOR';
 
-    // Hard reject flags
     const rejectLine = scoreResult.rejects.length > 0
         ? `‼️ REJECT: ${scoreResult.rejects.join(' | ')}\n\n`
         : '';
 
-    // Auto-buy indicator
     const autoBuyLine = scoreResult.shouldBuy
         ? `🤖 <b>AUTO-BUY TRIGGERED</b>\n\n`
         : `🚫 <i>Auto-buy dilewati (skor terlalu rendah)</i>\n\n`;
@@ -254,7 +285,6 @@ function initPumpRadar() {
         log.ok('Radar Pump.fun terhubung');
         ws.send(JSON.stringify({ method: 'subscribeNewToken' }));
 
-        // Re-subscribe ke posisi terbuka jika ada (setelah restart)
         const openMints = tradingEngine.posTracker.getAllPositions().map(p => p.mint);
         if (openMints.length > 0) {
             log.radar(`Re-subscribe ${openMints.length} posisi terbuka`);
@@ -289,9 +319,7 @@ function subscribeToMint(mint) {
 }
 
 function unsubscribeFromMint(mint) {
-    // HANYA unsubscribe jika koin tidak sedang di-track oleh radar (state.trackedTokens)
     if (state.trackedTokens.has(mint)) return;
-
     if (activeWs && activeWs.readyState === WebSocket.OPEN) {
         activeWs.send(JSON.stringify({ method: 'unsubscribeTokenTrade', keys: [mint] }));
     }
