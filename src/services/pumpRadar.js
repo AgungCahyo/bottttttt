@@ -265,7 +265,7 @@ function formatEarlySignalWithScore(mint, data, mcapSol, curve, scoreResult) {
         `<b>${f.esc(data.name)}</b>  <code>$${f.esc(data.symbol)}</code>\n\n` +
         rejectLine +
         (flags.length > 0 ? `${f.row('Flags', flags.join('  |  '))}\n\n` : '') +
-        `${f.row('Score', `<code>${bar}</code>  ${scoreResult.score}/100  ${rating}`)}\n\n` +
+        `${f.rowRaw('Score', `<code>${bar}</code>  ${scoreResult.score}/100  ${rating}`)}\n\n` +
         autoBuyLine +
         `${f.row('MCap', `$${usdMCap}  |  Curve  ${curve}%`)}\n` +
         `${f.row('Volume', `${data.volumeSol.toFixed(1)} SOL  (~$${usdVolume})`)}\n` +
