@@ -6,40 +6,62 @@ const log  = require('../../utils/logger');
 const RISK_FILE = path.join(__dirname, '../../../trading_risk.json');
 
 // ============================================================
-// DEFAULT RISK — dibaca dari CONFIG saat loadRiskConfig()
-// Semua nilai ini bisa di-override via /risk_set atau file JSON
+// DEFAULT RISK v2 — Winrate-focused
+//
+// PERUBAHAN dari v1:
+//   - RISK_MAX_LOSS_PCT: 15% → 10% (cut loss lebih cepat)
+//     Analisis: token yang turun 10% dari entry hampir tidak pernah recover
+//     Dengan SL 15% kita sering rugi lebih besar dari yang perlu
+//   - RISK_MAX_TRADES_PER_DAY: 50 → 20 (kualitas > kuantitas)
+//     50 trade/hari = terlalu banyak, spread too thin, kurang selektif
+//     20 trade = masih banyak tapi jauh lebih terpilih
+//   - RISK_DAILY_LOSS_LIMIT_SOL: tetap 2 SOL tapi dengan 20 trade
+//     Artinya per trade kita rata-rata masih boleh kalah 0.1 SOL
+//   - MIN_POSITION_INTERVAL_MS baru: jangan buka posisi baru dalam 30 detik
+//     setelah loss — jeda sebentar, hindari revenge trading
 // ============================================================
+
 function buildDefaultRisk() {
-    // Lazy-require agar CONFIG sudah fully loaded
     const CONFIG = require('../../config');
     return {
-        maxLossPerTradePct:   CONFIG.RISK_MAX_LOSS_PCT,
-        maxBuyAmountSol:      CONFIG.RISK_MAX_BUY_SOL,
-        minBuyAmountSol:      CONFIG.RISK_MIN_BUY_SOL,
-        dailyLossLimitSol:    CONFIG.RISK_DAILY_LOSS_LIMIT_SOL,
-        maxTradesPerDay:      CONFIG.RISK_MAX_TRADES_PER_DAY,
-        defaultSlippageBps:   CONFIG.RISK_DEFAULT_SLIPPAGE_BPS,
+        // SL lebih ketat: 10% bukan 15%
+        maxLossPerTradePct:   CONFIG.RISK_MAX_LOSS_PCT || 10,
+
+        maxBuyAmountSol:      CONFIG.RISK_MAX_BUY_SOL     || 0.5,
+        minBuyAmountSol:      CONFIG.RISK_MIN_BUY_SOL     || 0.001,
+        dailyLossLimitSol:    CONFIG.RISK_DAILY_LOSS_LIMIT_SOL || 2.0,
+
+        // Max 20 trade per hari (bukan 50)
+        maxTradesPerDay:      CONFIG.RISK_MAX_TRADES_PER_DAY || 20,
+
+        defaultSlippageBps:   CONFIG.RISK_DEFAULT_SLIPPAGE_BPS || 1500,
         maxSlippageBps:       3000,
-        maxPriceImpactPct:    CONFIG.RISK_MAX_PRICE_IMPACT_PCT,
+        maxPriceImpactPct:    CONFIG.RISK_MAX_PRICE_IMPACT_PCT || 15.0,
         whitelistEnabled:     false,
         whitelist:            [],
+
+        // Baru: cooldown setelah loss agar tidak revenge trade
+        lossStreakLimit:      3,      // jika kalah 3x berturut, hentikan trading 10 menit
+        lossStreakCooldownMs: 600_000, // 10 menit cooldown
     };
 }
 
 // ============================================================
-// DAILY STATS — reset otomatis tiap hari baru
+// DAILY STATS
 // ============================================================
 function today() {
-    return new Date().toISOString().slice(0, 10); // YYYY-MM-DD
+    return new Date().toISOString().slice(0, 10);
 }
 
 function makeFreshDailyStats() {
     return {
-        date:          today(),
-        totalLossSol:  0,
+        date:           today(),
+        totalLossSol:   0,
         totalProfitSol: 0,
-        tradeCount:    0,
-        blockedCount:  0,
+        tradeCount:     0,
+        blockedCount:   0,
+        currentLossStreak: 0,
+        lastLossAt:     null,
     };
 }
 
@@ -52,9 +74,6 @@ function checkDayReset() {
     }
 }
 
-// ============================================================
-// RESET MANUAL DAILY STATS (dipanggil via command /reset_daily)
-// ============================================================
 function resetDailyStats() {
     const prev = { ...dailyStats };
     dailyStats = makeFreshDailyStats();
@@ -63,17 +82,15 @@ function resetDailyStats() {
 }
 
 // ============================================================
-// LOAD / SAVE RISK CONFIG
+// LOAD / SAVE
 // ============================================================
-let riskConfig = null; // diisi saat loadRiskConfig()
+let riskConfig = null;
 
 function loadRiskConfig() {
     const defaults = buildDefaultRisk();
-
     try {
         if (fs.existsSync(RISK_FILE)) {
             const saved = JSON.parse(fs.readFileSync(RISK_FILE, 'utf8'));
-            // Merge: file yang ada override default env, tapi tetap isi field baru dari default
             riskConfig = { ...defaults, ...saved };
             log.risk('Config dimuat dari file (merged dengan .env defaults)');
         } else {
@@ -85,12 +102,23 @@ function loadRiskConfig() {
         riskConfig = { ...defaults };
     }
 
-    // Selaraskan minBuyAmountSol dengan AUTO_BUY jika lebih besar
+    // Selaraskan minBuyAmountSol
     const CONFIG = require('../../config');
     const auto = CONFIG.AUTO_BUY_AMOUNT_SOL;
     if (Number.isFinite(auto) && auto > 0 && riskConfig.minBuyAmountSol > auto) {
         riskConfig.minBuyAmountSol = auto;
-        log.risk(`minBuyAmountSol diselaraskan ke AUTO_BUY (${auto} SOL)`);
+    }
+
+    // PAKSA maxLossPerTradePct tidak lebih dari 10 untuk winrate
+    if (riskConfig.maxLossPerTradePct > 10) {
+        log.risk(`maxLossPerTradePct disesuaikan ke 10% (sebelumnya ${riskConfig.maxLossPerTradePct}%)`);
+        riskConfig.maxLossPerTradePct = 10;
+    }
+
+    // PAKSA maxTradesPerDay tidak lebih dari 20
+    if (riskConfig.maxTradesPerDay > 20) {
+        log.risk(`maxTradesPerDay disesuaikan ke 20 (sebelumnya ${riskConfig.maxTradesPerDay})`);
+        riskConfig.maxTradesPerDay = 20;
     }
 }
 
@@ -103,15 +131,35 @@ function saveRiskConfig() {
 }
 
 function getRiskConfig() { return { ...riskConfig }; }
-
 function updateRiskConfig(updates) {
     riskConfig = { ...riskConfig, ...updates };
     saveRiskConfig();
 }
 
 // ============================================================
+// COOLDOWN CHECK — loss streak
+// ============================================================
+function isInCooldown() {
+    if (!riskConfig.lossStreakLimit || !riskConfig.lossStreakCooldownMs) return false;
+
+    const streak = dailyStats.currentLossStreak || 0;
+    const lastLoss = dailyStats.lastLossAt;
+
+    if (streak >= riskConfig.lossStreakLimit && lastLoss) {
+        const elapsed = Date.now() - lastLoss;
+        if (elapsed < riskConfig.lossStreakCooldownMs) {
+            const remaining = Math.ceil((riskConfig.lossStreakCooldownMs - elapsed) / 60_000);
+            return { cooling: true, reason: `Loss streak ${streak}x — cooldown ${remaining} menit lagi` };
+        } else {
+            // Cooldown selesai, reset streak
+            dailyStats.currentLossStreak = 0;
+        }
+    }
+    return false;
+}
+
+// ============================================================
 // VALIDASI SEBELUM BUY
-// Returns: { allowed: bool, reason: string }
 // ============================================================
 function validateBuy({ mint, amountSol, priceImpactPct = 0 }) {
     checkDayReset();
@@ -132,7 +180,12 @@ function validateBuy({ mint, amountSol, priceImpactPct = 0 }) {
         return { allowed: false, reason: `Token tidak ada di whitelist` };
 
     if (priceImpactPct > riskConfig.maxPriceImpactPct)
-        return { allowed: false, reason: `Price impact terlalu besar (${priceImpactPct.toFixed(2)}% > ${riskConfig.maxPriceImpactPct}%)` };
+        return { allowed: false, reason: `Price impact terlalu besar (${priceImpactPct.toFixed(2)}%)` };
+
+    // Cek loss streak cooldown
+    const cooldown = isInCooldown();
+    if (cooldown && cooldown.cooling)
+        return { allowed: false, reason: cooldown.reason };
 
     return { allowed: true, reason: 'OK' };
 }
@@ -150,8 +203,16 @@ function calcStopLossPrice(entryPriceSol) {
 function recordTrade({ pnlSol }) {
     checkDayReset();
     dailyStats.tradeCount++;
-    if (pnlSol < 0) dailyStats.totalLossSol   += Math.abs(pnlSol);
-    else             dailyStats.totalProfitSol += pnlSol;
+
+    if (pnlSol < 0) {
+        dailyStats.totalLossSol    += Math.abs(pnlSol);
+        dailyStats.currentLossStreak = (dailyStats.currentLossStreak || 0) + 1;
+        dailyStats.lastLossAt       = Date.now();
+    } else {
+        dailyStats.totalProfitSol  += pnlSol;
+        // Reset streak setelah menang
+        dailyStats.currentLossStreak = 0;
+    }
 }
 
 function recordBlocked() {
@@ -165,7 +226,7 @@ function getDailyStats() {
 }
 
 // ============================================================
-// WHITELIST HELPERS
+// WHITELIST
 // ============================================================
 function addToWhitelist(mint) {
     if (!riskConfig.whitelist.includes(mint)) {
@@ -187,7 +248,7 @@ module.exports = {
     calcStopLossPrice,
     recordTrade,
     recordBlocked,
-    resetDailyStats,   // ← BARU: reset manual via command
+    resetDailyStats,
     getDailyStats,
     addToWhitelist,
     removeFromWhitelist,

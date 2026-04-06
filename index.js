@@ -5,6 +5,9 @@ const { Telegraf } = require('telegraf');
 const CONFIG  = require('./src/config');
 const state   = require('./src/config/state');
 
+const { registerSaasHandlers } = require('./saas-system/saasHandlers');
+const { startMonitor }         = require('./saas-system/paymentMonitor');
+
 const telegram              = require('./src/services/telegram');
 const { startPriceUpdater } = require('./src/services/solPrice');
 const { startNewsPolling }  = require('./src/services/news');
@@ -25,6 +28,7 @@ app.use('/', routes);
 telegram.init(bot);
 registerHandlers(bot);
 registerTradingHandlers(bot, isAdmin, requireAdmin);
+registerSaasHandlers(bot);
 registerFallbackHandler(bot);
 
 // 🛡️ BULLETPROOF ERROR HANDLERS
@@ -71,6 +75,7 @@ async function start() {
         log.section('INISIALISASI TELEGRAM');
         await bot.telegram.deleteWebhook({ drop_pending_updates: true }).catch(() => {});
         await bot.launch();
+        startMonitor(bot, CONFIG.TELEGRAM_CHANNEL_ID);
         log.bots('Bot Telegram aktif\n');
 
     } catch (err) {
