@@ -113,6 +113,58 @@ function createSafeError(message, details = {}) {
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
+const priceCache = new Map();
+function getCached(key, ttlMs) {
+    const row = priceCache.get(key);
+    if (!row) return null;
+    if (Date.now() - row.ts > ttlMs) return null;
+    return row.value;
+}
+function setCached(key, value) {
+    priceCache.set(key, { value, ts: Date.now() });
+}
+
+function parseRetryAfterMs(err) {
+    const sec = err?.response?.headers?.['retry-after'];
+    if (sec != null) {
+        const n = Number(sec);
+        if (Number.isFinite(n) && n > 0) return Math.ceil(n * 1000);
+    }
+    return 0;
+}
+
+async function httpGet(url, opts = {}, label = 'http_get') {
+    const CONFIG = require('../config');
+    const maxRetry = Math.max(0, Number(CONFIG.HTTP_MAX_RETRIES_429) || 4);
+    for (let i = 0; i <= maxRetry; i++) {
+        try {
+            return await axios.get(url, opts);
+        } catch (e) {
+            const status = e?.response?.status;
+            if (status !== 429 || i >= maxRetry) throw e;
+            const backoff = parseRetryAfterMs(e) || Math.min(5000, 400 * (2 ** i));
+            log.warn(`[${label}] 429; retry in ${backoff}ms`);
+            await sleep(backoff + Math.floor(Math.random() * 120));
+        }
+    }
+}
+
+async function httpPost(url, body, opts = {}, label = 'http_post') {
+    const CONFIG = require('../config');
+    const maxRetry = Math.max(0, Number(CONFIG.HTTP_MAX_RETRIES_429) || 4);
+    for (let i = 0; i <= maxRetry; i++) {
+        try {
+            return await axios.post(url, body, opts);
+        } catch (e) {
+            const status = e?.response?.status;
+            if (status !== 429 || i >= maxRetry) throw e;
+            const backoff = parseRetryAfterMs(e) || Math.min(5000, 400 * (2 ** i));
+            log.warn(`[${label}] 429; retry in ${backoff}ms`);
+            await sleep(backoff + Math.floor(Math.random() * 120));
+        }
+    }
+}
+
 /** Kurangi angka sim (token atau SOL) agar lebih konservatif vs eksekusi real. */
 function applySimExtraImpact(raw, extraBps) {
     if (!(raw > 0) || !Number.isFinite(raw)) return raw;
@@ -763,13 +815,13 @@ async function pumpswapSell({ inputMint, amountTokens, slippageBps = 1500, prior
 // ============================================================
 async function jupiterBuy({ outputMint, amountLamports, slippageBps }) {
     log.jupiter('Fallback buy…');
-    const { data: q } = await axios.get('https://api.jup.ag/swap/v1/quote', {
+    const { data: q } = await httpGet('https://api.jup.ag/swap/v1/quote', {
         params: { inputMint: SOL_MINT, outputMint, amount: amountLamports, slippageBps }, timeout: 10_000,
-    });
-    const { data: s } = await axios.post('https://api.jup.ag/swap/v1/swap', {
+    }, 'jupiter_buy_quote');
+    const { data: s } = await httpPost('https://api.jup.ag/swap/v1/swap', {
         quoteResponse: q, userPublicKey: wallet.publicKey.toBase58(),
         wrapAndUnwrapSol: true, dynamicComputeUnitLimit: true, prioritizationFeeLamports: 'auto',
-    }, { timeout: 15_000 });
+    }, { timeout: 15_000 }, 'jupiter_buy_swap');
 
     const { VersionedTransaction } = require('@solana/web3.js');
     const tx = VersionedTransaction.deserialize(Buffer.from(s.swapTransaction, 'base64'));
@@ -784,13 +836,13 @@ async function jupiterBuy({ outputMint, amountLamports, slippageBps }) {
 async function jupiterSell({ inputMint, amountTokens, slippageBps }) {
     log.jupiter('Fallback sell…');
     const amount = Math.floor(amountTokens * 1e6);
-    const { data: q } = await axios.get('https://api.jup.ag/swap/v1/quote', {
+    const { data: q } = await httpGet('https://api.jup.ag/swap/v1/quote', {
         params: { inputMint, outputMint: SOL_MINT, amount, slippageBps }, timeout: 10_000,
-    });
-    const { data: s } = await axios.post('https://api.jup.ag/swap/v1/swap', {
+    }, 'jupiter_sell_quote');
+    const { data: s } = await httpPost('https://api.jup.ag/swap/v1/swap', {
         quoteResponse: q, userPublicKey: wallet.publicKey.toBase58(),
         wrapAndUnwrapSol: true, dynamicComputeUnitLimit: true, prioritizationFeeLamports: 'auto',
-    }, { timeout: 15_000 });
+    }, { timeout: 15_000 }, 'jupiter_sell_swap');
 
     const { VersionedTransaction } = require('@solana/web3.js');
     const tx = VersionedTransaction.deserialize(Buffer.from(s.swapTransaction, 'base64'));
@@ -862,9 +914,9 @@ async function findPool(baseMint) {
     if (info) return parsePool(poolPda, info.data);
 
     try {
-        const { data } = await axios.get(
+        const { data } = await httpGet(
             `https://api.dexscreener.com/latest/dex/tokens/${baseMint.toBase58()}`, { timeout: 8_000 }
-        );
+        , 'dex_pool_lookup');
         const pair = (data?.pairs || []).find(p => ['pumpswap','pump'].includes(p.dexId));
         if (pair?.pairAddress) {
             const pKey = new PublicKey(pair.pairAddress);
@@ -1111,10 +1163,10 @@ function _jupiterOutSol(q) {
 }
 
 async function quoteJupiterBuyUi(outputMint, amountLamports, slippageBps = 1500) {
-    const { data: q } = await axios.get('https://api.jup.ag/swap/v1/quote', {
+    const { data: q } = await httpGet('https://api.jup.ag/swap/v1/quote', {
         params: { inputMint: SOL_MINT, outputMint, amount: amountLamports, slippageBps },
         timeout: 12_000,
-    });
+    }, 'quote_jupiter_buy_ui');
     if (!q?.outAmount) throw createSafeError('Jupiter quote buy kosong', { code: 'JUP_QUOTE' });
     const ui = _jupiterOutTokenUi(q);
     if (ui <= 0) throw createSafeError('Jupiter quote buy = 0', { code: 'JUP_QUOTE' });
@@ -1123,10 +1175,10 @@ async function quoteJupiterBuyUi(outputMint, amountLamports, slippageBps = 1500)
 
 async function quoteJupiterSellSol(inputMint, amountTokens, slippageBps = 1500) {
     const amount = Math.floor(amountTokens * 1e6);
-    const { data: q } = await axios.get('https://api.jup.ag/swap/v1/quote', {
+    const { data: q } = await httpGet('https://api.jup.ag/swap/v1/quote', {
         params: { inputMint, outputMint: SOL_MINT, amount, slippageBps },
         timeout: 12_000,
-    });
+    }, 'quote_jupiter_sell_sol');
     if (!q?.outAmount) throw createSafeError('Jupiter quote sell kosong', { code: 'JUP_QUOTE' });
     const sol = _jupiterOutSol(q);
     if (sol <= 0) throw createSafeError('Jupiter quote sell = 0', { code: 'JUP_QUOTE' });
@@ -1220,32 +1272,62 @@ async function executeSellSimulated({ inputMint, amountTokens, slippageBps = 150
 // HARGA TOKEN
 // ============================================================
 async function getTokenPriceInSol(mintAddress) {
+    const CONFIG = require('../config');
+    const ttlMs = Math.max(300, Number(CONFIG.PRICE_CACHE_TTL_MS) || 1500);
+    const cacheKey = `tok_price_sol:${mintAddress}`;
+    const cached = getCached(cacheKey, ttlMs);
+    if (cached != null) return cached;
+
     const solPrice = require('../config/state').currentSolPrice;
     if (!solPrice || solPrice <= 0) return null;
     try {
-        const { data } = await axios.get(`https://api.dexscreener.com/latest/dex/tokens/${mintAddress}`, { timeout: 6_000 });
+        const { data } = await httpGet(`https://api.dexscreener.com/latest/dex/tokens/${mintAddress}`, { timeout: 6_000 }, 'dex_token_price');
         const pair = data?.pairs?.[0];
-        if (pair?.priceUsd) return parseFloat(pair.priceUsd) / solPrice;
+        if (pair?.priceUsd) {
+            const v = parseFloat(pair.priceUsd) / solPrice;
+            if (v > 0) {
+                setCached(cacheKey, v);
+                return v;
+            }
+        }
     } catch { /* next */ }
     try {
-        const { data } = await axios.get(`https://api.jup.ag/price/v2?ids=${mintAddress}`, { timeout: 6_000 });
+        const { data } = await httpGet(`https://api.jup.ag/price/v2?ids=${mintAddress}`, { timeout: 6_000 }, 'jupiter_token_price');
         const price = data?.data?.[mintAddress]?.price;
-        if (price) return parseFloat(price) / solPrice;
+        if (price) {
+            const v = parseFloat(price) / solPrice;
+            if (v > 0) {
+                setCached(cacheKey, v);
+                return v;
+            }
+        }
     } catch { /* ignore */ }
     return null;
 }
 
 /** Mark harga SOL/token: BC dari quote SDK (realtime on-chain), atau DexScreener/Jupiter jika sudah graduate. */
 async function getSpotSolPerToken(mintAddress) {
+    const CONFIG = require('../config');
+    const ttlMs = Math.max(300, Number(CONFIG.PRICE_CACHE_TTL_MS) || 1500);
+    const cacheKey = `spot_sol_tok:${mintAddress}`;
+    const cached = getCached(cacheKey, ttlMs);
+    if (cached != null) return cached;
+
     const graduated = await isGraduated(mintAddress).catch(() => true);
     if (!graduated) {
         try {
             const probeLamports = 150_000; // ~0.00015 SOL — cukup untuk marginal price tanpa membebani kurva
             const tokensUi = await quoteBondingCurveBuyUi(mintAddress, probeLamports);
-            if (tokensUi > 0) return (probeLamports / LAMPORTS_PER_SOL) / tokensUi;
+            if (tokensUi > 0) {
+                const v = (probeLamports / LAMPORTS_PER_SOL) / tokensUi;
+                setCached(cacheKey, v);
+                return v;
+            }
         } catch { /* race graduate / RPC */ }
     }
-    return getTokenPriceInSol(mintAddress);
+    const fallback = await getTokenPriceInSol(mintAddress);
+    if (fallback != null) setCached(cacheKey, fallback);
+    return fallback;
 }
 
 // ============================================================

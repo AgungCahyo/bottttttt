@@ -247,6 +247,7 @@ function registerTradingHandlers(bot, isAdmin, requireAdmin) {
                 `${f.header('POSITION CLOSED')}\n` +
                 `${f.sep()}\n` +
                 `${f.row('Token', esc(result?.symbol))}\n` +
+                `${f.row('CA', mint, true)}\n` +
                 `${f.row('PnL', `${f.signed(result?.pnlSol)} SOL  (${result?.pnlPct?.toFixed(1)}%)`)}\n` +
                 `${f.sep()}\n` +
                 `${f.txLink(result?.exitTxid)}`,

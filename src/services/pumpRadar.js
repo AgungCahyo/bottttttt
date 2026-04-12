@@ -8,6 +8,7 @@ const scorer  = require('../trading/signalScorer');
 const f       = require('../utils/tgFormat');
 const { sendToChannel } = require('./telegram');
 const tradingEngine = require('../trading/tradingEngine');
+const copyTrader    = require('./copyTrader');
 const log = require('../utils/logger');
 
 const WS_URL = 'wss://pumpportal.fun/api/data';
@@ -17,10 +18,13 @@ const PUMP_STREAM_STRONG_SOL = 0.03;
 const PUMP_STREAM_WEAK_SOL   = 0.012;
 const STREAM_MARK_MIN_RATIO  = 0.3;
 const STREAM_MARK_MAX_RATIO  = 3.5;
-const SPOT_REFRESH_DEBOUNCE_MS = 320;
+const SPOT_REFRESH_DEBOUNCE_MS = Math.max(250, Number(CONFIG.STREAM_SPOT_REFRESH_DEBOUNCE_MS) || 1200);
+const SPOT_MIN_REFRESH_INTERVAL_MS = Math.max(500, Number(CONFIG.STREAM_SPOT_MIN_REFRESH_INTERVAL_MS) || 3000);
 
 const lastMarkByMint    = new Map();
 const spotRefreshTimers = new Map();
+const spotRefreshInflight = new Set();
+const lastSpotRefreshAt = new Map();
 
 function markPlausible(mint, implied) {
     const prev = lastMarkByMint.get(mint);
@@ -31,17 +35,26 @@ function markPlausible(mint, implied) {
 
 function scheduleSpotRefresh(mint) {
     if (spotRefreshTimers.has(mint)) return;
+    if (spotRefreshInflight.has(mint)) return;
+    const last = lastSpotRefreshAt.get(mint) || 0;
+    if (Date.now() - last < SPOT_MIN_REFRESH_INTERVAL_MS) return;
     const t = setTimeout(() => {
         spotRefreshTimers.delete(mint);
         (async () => {
+            if (spotRefreshInflight.has(mint)) return;
+            spotRefreshInflight.add(mint);
             try {
                 const pump = require('../trading/pumpClient');
                 const spot = await pump.getSpotSolPerToken(mint);
                 if (spot != null && spot > 0 && Number.isFinite(spot)) {
                     lastMarkByMint.set(mint, spot);
+                    lastSpotRefreshAt.set(mint, Date.now());
                     tradingEngine.handleStreamPrice(mint, spot).catch(() => {});
                 }
             } catch { /* ignore */ }
+            finally {
+                spotRefreshInflight.delete(mint);
+            }
         })();
     }, SPOT_REFRESH_DEBOUNCE_MS);
     spotRefreshTimers.set(mint, t);
@@ -87,12 +100,21 @@ function createTokenEntry(event) {
         sells:       0,
         whales:      0,
         maxWhaleBuy: 0,
+        recentBuys:  0,
         isAlerted:   false,
         isDevSold:   false,
         isBundled:   false,
         alertMCapSol: 0,
         milestones:  new Set(),
+        tradeTape:   [], // { ts, type, sol, trader }
+        buySolByWallet: new Map(),
     };
+}
+
+function pruneTradeTape(token, now = Date.now()) {
+    // Keep last 2 minutes only; enough for momentum windows.
+    const minTs = now - 120_000;
+    token.tradeTape = token.tradeTape.filter(t => t.ts >= minTs);
 }
 
 function calcMCapSol(solAmount, tokenAmount) {
@@ -126,6 +148,9 @@ async function handleTrade(event) {
     const tokenAmt  = parseFloat(event.tokenAmount || 0);
     const trader    = event.traderPublicKey;
 
+    // Optional: copy-trading (Trojan-style) based on watched wallets
+    copyTrader.handlePumpPortalTrade(event).catch(() => {});
+
     if (event.mint && tradingEngine.posTracker.hasPosition(event.mint)) {
         updatePositionStreamMark(event.mint, solAmount, tokenAmt);
     }
@@ -134,12 +159,24 @@ async function handleTrade(event) {
     if (!token) return;
 
     const timeDiffMs = Date.now() - token.startTime;
+    const now = Date.now();
 
     token.volumeSol += solAmount;
+    token.tradeTape.push({
+        ts: now,
+        type: event.txType,
+        sol: Number.isFinite(solAmount) ? solAmount : 0,
+        trader: trader || null,
+    });
+    pruneTradeTape(token, now);
 
     if (event.txType === 'buy') {
         token.buys++;
         if (trader) token.buyers.add(trader);
+        if (trader) {
+            const prev = token.buySolByWallet.get(trader) || 0;
+            token.buySolByWallet.set(trader, prev + (Number.isFinite(solAmount) ? solAmount : 0));
+        }
         if (solAmount >= CONFIG.MIN_WHALE_SOL) {
             token.whales++;
             if (solAmount > token.maxWhaleBuy) token.maxWhaleBuy = solAmount;
@@ -151,6 +188,13 @@ async function handleTrade(event) {
         token.sells++;
         if (trader === token.dev) token.isDevSold = true;
     }
+
+    // Rolling recent buys in last 30s (used by scorer)
+    const minTs30 = now - 30_000;
+    token.recentBuys = token.tradeTape.reduce((acc, t) => {
+        if (t.ts < minTs30) return acc;
+        return acc + (t.type === 'buy' ? 1 : 0);
+    }, 0);
 
     const mcapSol = calcMCapSol(solAmount, tokenAmt);
     const curve   = calcCurveProgress(token.volumeSol);
@@ -339,6 +383,8 @@ posTracker.on('opened', (pos) => {
 posTracker.on('closed', (pos) => {
     if (!pos?.mint) return;
     lastMarkByMint.delete(pos.mint);
+    lastSpotRefreshAt.delete(pos.mint);
+    spotRefreshInflight.delete(pos.mint);
     const tid = spotRefreshTimers.get(pos.mint);
     if (tid) clearTimeout(tid);
     spotRefreshTimers.delete(pos.mint);

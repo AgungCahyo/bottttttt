@@ -56,6 +56,92 @@ function priorityMicroForPos(pos) {
     return c.PRIORITY_MICRO_LAMPORTS_DEFAULT;
 }
 
+function resolveStopLossPct(scoreResult, riskCfg) {
+    const CONFIG = require('../config');
+    const base = Number(riskCfg?.maxLossPerTradePct) || 10;
+    if (!CONFIG.ENABLE_ADAPTIVE_STOPLOSS) return base;
+
+    const minPct = Number(CONFIG.ADAPTIVE_SL_MIN_PCT) || 6;
+    const maxPct = Number(CONFIG.ADAPTIVE_SL_MAX_PCT) || 14;
+    const basePct = Number(CONFIG.ADAPTIVE_SL_BASE_PCT) || base;
+    const rec = Number(scoreResult?.recommendedSlPct);
+    const riskTag = scoreResult?.riskLevel;
+
+    let resolved = Number.isFinite(rec) ? rec : basePct;
+    if (riskTag === 'low') resolved = Math.min(resolved, basePct - 1);
+    if (riskTag === 'high') resolved = Math.max(resolved, basePct + 1);
+    return Math.max(minPct, Math.min(maxPct, resolved));
+}
+
+function resolvePositionSizing(amountSolBase, scoreResult, riskCfg, opts = {}) {
+    const CONFIG = require('../config');
+    const useOverride = Number.isFinite(opts.amountSolOverride) && opts.amountSolOverride > 0;
+    const applyRiskSizingOnOverride = !!opts.applyRiskSizingOnOverride;
+    if (!CONFIG.ENABLE_AUTO_POSITION_SIZING) return { amountSol: amountSolBase, multiplier: 1 };
+    if (useOverride && !applyRiskSizingOnOverride) return { amountSol: amountSolBase, multiplier: 1 };
+
+    const riskLevel = scoreResult?.riskLevel || 'medium';
+    const rawMul = riskLevel === 'low'
+        ? Number(CONFIG.POSITION_SIZE_MULTIPLIER_LOW)
+        : riskLevel === 'high'
+            ? Number(CONFIG.POSITION_SIZE_MULTIPLIER_HIGH)
+            : Number(CONFIG.POSITION_SIZE_MULTIPLIER_MEDIUM);
+
+    const multiplier = Number.isFinite(rawMul) ? Math.max(0.1, Math.min(2, rawMul)) : 1;
+    let sized = amountSolBase * multiplier;
+
+    // Keep sizing inside configured risk limits.
+    if (Number.isFinite(riskCfg?.maxBuyAmountSol) && riskCfg.maxBuyAmountSol > 0) {
+        sized = Math.min(sized, riskCfg.maxBuyAmountSol);
+    }
+    if (Number.isFinite(riskCfg?.minBuyAmountSol) && riskCfg.minBuyAmountSol > 0) {
+        sized = Math.max(sized, riskCfg.minBuyAmountSol);
+    }
+
+    return { amountSol: sized, multiplier };
+}
+
+async function maybeExecuteTimeStop(pos, currentPriceSol) {
+    const CONFIG = require('../config');
+    if (!CONFIG.ENABLE_TIME_STOP) return false;
+    if (!pos?.openedAt || !(currentPriceSol > 0) || !(pos.entryPriceSol > 0)) return false;
+
+    const ageMs = Date.now() - pos.openedAt;
+    const minAgeMs = Math.max(1, Number(CONFIG.TIME_STOP_AFTER_MINUTES) || 20) * 60_000;
+    if (ageMs < minAgeMs) return false;
+
+    const pnlPct = ((currentPriceSol / pos.entryPriceSol) - 1) * 100;
+    const maxDd = Math.abs(Number(CONFIG.TIME_STOP_MAX_DRAWDOWN_PCT) || 6);
+    if (pnlPct > -maxDd) return false;
+
+    if (stopLossInflight.has(pos.mint)) return true;
+    stopLossInflight.add(pos.mint);
+    trailingStop.removeTrail(pos.mint);
+
+    try {
+        const bal = await pump.getBalance(pos.mint);
+        if (!bal || bal <= 0) {
+            posTracker.closePosition(pos.mint, { exitPriceSol: currentPriceSol, reason: 'time_stop_empty' });
+            return true;
+        }
+        const result = await executeSellWithDustPasses(pos.mint, bal, {
+            slippageBps: 2600,
+            isSimulation: pos.isSimulation || CONFIG.ENABLE_SIMULATION_MODE,
+            priorityMicroLamports: priorityMicroForPos(pos),
+        }, true);
+        const pnlSol = (currentPriceSol - pos.entryPriceSol) * bal;
+        posTracker.closePosition(pos.mint, { exitPriceSol: currentPriceSol, reason: 'time_stop', txid: result.txid });
+        riskManager.recordTrade({ pnlSol });
+        log.stopLoss(`${pos.symbol}  |  TIME-STOP ${pnlPct.toFixed(2)}%`);
+        return true;
+    } catch (e) {
+        log.err(`Time-stop failed [${pos.symbol}]: ${e?.message || e}`);
+        return false;
+    } finally {
+        stopLossInflight.delete(pos.mint);
+    }
+}
+
 async function executeSellWithDustPasses(inputMint, amountTokens, { slippageBps, isSimulation, priorityMicroLamports }, dustSweep = false) {
     const CONFIG = require('../config');
     const sellOnce = (amt) => pump.executeSell({
@@ -106,7 +192,8 @@ function init({ rpcUrl, privateKeyBase58 }) {
     log.info(`Open positions: ${allPos.length}  |  mode: ${isSimMode ? 'SIMULATION' : 'LIVE'}`);
 
     setInterval(dcaTick, DCA_TICK_INTERVAL_MS);
-    setInterval(priceMonitorTick, PRICE_CHECK_INTERVAL_MS);
+    const priceInterval = isSimMode ? Math.max(2500, PRICE_CHECK_INTERVAL_MS) : PRICE_CHECK_INTERVAL_MS;
+    setInterval(priceMonitorTick, priceInterval);
 
     initialized = true;
     log.engine(`Active — wallet: ${walletAddress}`);
@@ -182,6 +269,8 @@ async function handleStreamPrice(mint, currentPrice) {
             return;
         }
 
+        if (await maybeExecuteTimeStop(pos, currentPrice)) return;
+
         await grid.tick(mint, currentPrice);
 
         const action = trailingStop.update(mint, currentPrice);
@@ -211,6 +300,11 @@ async function priceMonitorTick() {
                 if (!stopLossInflight.has(pos.mint)) {
                     await executeStopLossClose(pos, currentPrice);
                 }
+                await sleep(PRICE_REQUEST_DELAY_MS);
+                continue;
+            }
+
+            if (await maybeExecuteTimeStop(pos, currentPrice)) {
                 await sleep(PRICE_REQUEST_DELAY_MS);
                 continue;
             }
@@ -263,6 +357,7 @@ async function executeStopLossClose(pos, currentPriceSol) {
                 `${f.header('STOP LOSS' + simTag)}\n` +
                 `${f.sep()}\n` +
                 `${f.row('Token', esc(pos.symbol))}\n` +
+                `${f.row('CA', mint, true)}\n` +
                 `${f.row('Price', currentPriceSol.toFixed(8), true)}\n` +
                 `${f.row('SL level', pos.stopLossPriceSol?.toFixed(8), true)}\n` +
                 `${f.row('PnL', `${f.signed(pnlSol)} SOL`)}\n` +
@@ -280,6 +375,7 @@ async function executeStopLossClose(pos, currentPriceSol) {
                 `${f.header('STOP LOSS FAILED')}\n` +
                 `${f.sep()}\n` +
                 `${f.row('Token', esc(pos.symbol))}\n` +
+                `${f.row('CA', mint, true)}\n` +
                 `${f.row('Error', msg.slice(0, 120))}`
             ).catch(() => {});
         }
@@ -356,6 +452,7 @@ async function handleTrailAction(pos, action, currentPriceSol) {
                 `${f.header(action.phase + simTag)}\n` +
                 `${f.sep()}\n` +
                 `${f.row('Token', esc(pos.symbol))}\n` +
+                `${f.row('CA', pos.mint, true)}\n` +
                 `${f.row('Multiplier', `${action.multiplier}x from entry`)}\n` +
                 `${f.row('Sold', sellLabel)}\n` +
                 `${f.row('PnL batch', `${f.signed(pnlSol)} SOL  (${pnlPct.toFixed(1)}%)`)}\n` +
@@ -378,6 +475,7 @@ async function handleTrailAction(pos, action, currentPriceSol) {
                     `${f.header('TRAIL FAILED')}\n` +
                     `${f.sep()}\n` +
                     `${f.row('Token', esc(pos.symbol))}\n` +
+                    `${f.row('CA', pos.mint, true)}\n` +
                     `${f.row('Error', errorMsg.slice(0, 100))}`
                 ).catch(() => {});
             }
@@ -388,7 +486,7 @@ async function handleTrailAction(pos, action, currentPriceSol) {
 // ============================================================
 // AUTO BUY
 // ============================================================
-async function executeAutoBuy(mint, symbol, token, scoreResult) {
+async function executeAutoBuy(mint, symbol, token, scoreResult, opts = {}) {
     const CONFIG = require('../config');
 
     if (buyLockSet.has(mint))           return null;
@@ -401,8 +499,12 @@ async function executeAutoBuy(mint, symbol, token, scoreResult) {
     buyLockSet.add(mint);
     setTimeout(() => buyLockSet.delete(mint), 60_000);
 
-    const amountSol = CONFIG.AUTO_BUY_AMOUNT_SOL;
+    const amountSolBase = (Number.isFinite(opts.amountSolOverride) && opts.amountSolOverride > 0)
+        ? opts.amountSolOverride
+        : CONFIG.AUTO_BUY_AMOUNT_SOL;
     const risk      = riskManager.getRiskConfig();
+    const sizing    = resolvePositionSizing(amountSolBase, scoreResult, risk, opts);
+    const amountSol = sizing.amountSol;
 
     const validation = riskManager.validateBuy({ mint, amountSol });
     if (!validation.allowed) {
@@ -428,7 +530,11 @@ async function executeAutoBuy(mint, symbol, token, scoreResult) {
     }
 
     const modeTag = CONFIG.ENABLE_SIMULATION_MODE ? '[SIM]' : '[LIVE]';
-    log.trade(`${modeTag} AUTO-BUY: ${symbol}  score=${scoreResult.score}  ${amountSol} SOL`);
+    const label   = opts.strategyLabel || 'AUTO-BUY';
+    log.trade(
+        `${modeTag} ${label}: ${symbol}  score=${scoreResult.score}  ${amountSol.toFixed(4)} SOL` +
+        `  (x${sizing.multiplier.toFixed(2)}, risk=${scoreResult?.riskLevel || 'n/a'})`
+    );
 
     let result;
     try {
@@ -449,8 +555,9 @@ async function executeAutoBuy(mint, symbol, token, scoreResult) {
         if (!result.txid || result.outputAmount <= 0)
             throw new Error(`Zero output: ${result.outputAmount || 0} tokens`);
 
-        const entryPriceSol    = amountSol / result.outputAmount;
-        const stopLossPriceSol = entryPriceSol * (1 - risk.maxLossPerTradePct / 100);
+        const entryPriceSol = amountSol / result.outputAmount;
+        const stopLossPct = resolveStopLossPct(scoreResult, risk);
+        const stopLossPriceSol = entryPriceSol * (1 - stopLossPct / 100);
 
         posTracker.openPosition({
             mint, symbol,
@@ -459,10 +566,13 @@ async function executeAutoBuy(mint, symbol, token, scoreResult) {
             amountToken:         result.outputAmount,
             initialAmountToken:  result.outputAmount,
             amountSol,
-            strategy:            'AUTO',
+            strategy:            opts.strategyCode || 'AUTO',
             txid:                result.txid,
             isSimulation:        !!result.isSimulation,
             scoreAtEntry:        scoreResult.score,
+            stopLossPctAtEntry:  stopLossPct,
+            scoreProfile:        scoreResult.profile || null,
+            entryRiskLevel:      scoreResult.riskLevel || null,
         });
 
         trailingStop.initTrail(mint, entryPriceSol);
@@ -474,11 +584,14 @@ async function executeAutoBuy(mint, symbol, token, scoreResult) {
                 `${f.header('AUTO-BUY EXECUTED' + simTag)}\n` +
                 `${f.sep()}\n` +
                 `${f.row('Token', esc(symbol))}\n` +
+                `${f.row('CA', mint, true)}\n` +
                 `${f.row('Score', `${scoreResult.score} / 100`)}\n` +
+                `${f.row('Risk regime', scoreResult.riskLevel || 'n/a')}\n` +
+                `${f.row('Position size', `${amountSol.toFixed(4)} SOL  (x${sizing.multiplier.toFixed(2)})`)}\n` +
                 `${f.row('Spent', `${amountSol} SOL`)}\n` +
                 `${f.row('Received', `${result.outputAmount.toFixed(0)} tokens`)}\n` +
                 `${f.row('Entry price', entryPriceSol.toFixed(8), true)}\n` +
-                `${f.row('Stop loss', stopLossPriceSol.toFixed(8), true)}\n` +
+                `${f.row('Stop loss', `${stopLossPriceSol.toFixed(8)}  (${stopLossPct.toFixed(1)}%)`, true)}\n` +
                 `${f.sep()}\n` +
                 `${f.txLink(result.txid)}`
             );
@@ -514,6 +627,7 @@ async function executeAutoBuy(mint, symbol, token, scoreResult) {
                     `${f.header('AUTO-BUY FAILED')}\n` +
                     `${f.sep()}\n` +
                     `${f.row('Token', esc(symbol))}\n` +
+                    `${f.row('CA', mint, true)}\n` +
                     `${f.row('Score', scoreResult.score)}\n` +
                     `${f.row('Error', errorMsg.slice(0, 120))}\n` +
                     `${f.row('Code', errorCode)}`

@@ -2,209 +2,206 @@
 
 const CONFIG = require('../config');
 
-// ============================================================
-// SIGNAL SCORER v2 — Winrate-focused rewrite
-//
-// Insight dari riset & analisis loss trade sebelumnya:
-//
-// MASALAH LAMA:
-//   - Terlalu banyak trade (50/hari), banyak false positive
-//   - Score 75-80 winrate jelek → perlu ambang yang lebih tinggi
-//   - Trailing stop terlalu sensitif (exit terlalu cepat di 1.0-1.2x)
-//   - SL terlalu longgar (-15%) tapi entry sering langsung dump
-//   - Tidak ada deteksi "momentum sudah habis saat alert"
-//   - SUSPICIOUS_WHALE_CLUSTER terlalu mudah dilewati (> 30 detik)
-//
-// PERBAIKAN:
-//   1. Skor lebih ketat: autobuy hanya jika >= 80 (bukan 75)
-//   2. Hard reject lebih banyak & agresif:
-//      - HIGH_SELL_RATIO sekarang > 35% (bukan 40%)
-//      - WHALE_CLUSTER tidak ada batas waktu lagi (seumur token)
-//      - LOW_UNIQUE_BUYERS threshold lebih rendah (vol > 15 SOL)
-//      - NEW: VELOCITY_DYING — momentum sedang mati saat alert
-//      - NEW: SELL_DOMINATES — lebih banyak sell tx daripada buy
-//   3. Bobot skor direfaktorisasi:
-//      - Buyer diversity naik (sinyal paling kuat)
-//      - Whale quality (bukan hanya jumlah) dihitung
-//      - Volume per buyer LEBIH diutamakan
-//      - Penalty bundled lebih besar (-25)
-//   4. Bonus baru: ORGANIC_GROWTH bonus jika semua indikator bagus
-// ============================================================
+// Trojan/Axiom-like flow:
+// 1) Timing gate  -> token tidak terlalu dini / tidak telat.
+// 2) Hard filters -> rug pattern, sell pressure, concentration.
+// 3) Confidence   -> weighted score dari pressure + quality + velocity.
 
-function minScoreToBuy() {
-    const n = CONFIG.SIGNAL_MIN_SCORE;
-    // Floor 80 secara paksa — di bawah itu winrate historis < 40%
-    const effective = Math.max(80, Number.isFinite(n) && n >= 0 ? n : 80);
-    return Math.min(effective, 100);
+function clamp(v, lo, hi) {
+    return Math.max(lo, Math.min(hi, v));
 }
 
-// ============================================================
-// KALKULASI VELOCITY SAAT INI vs VELOCITY PUNCAK
-// Deteksi apakah momentum sedang mati saat sinyal pertama muncul
-// ============================================================
-function calcVelocityDecay(token, timeDiffSec) {
-    // Hanya relevan jika token sudah cukup tua (> 60 detik)
-    if (timeDiffSec < 60) return { isDying: false, currentVelocity: token.buys / Math.max(timeDiffSec / 60, 0.1) };
-
-    // Estimasi velocity di paruh pertama vs paruh kedua waktu
-    // Kita punya total buys & total waktu; bisa estimasi decay
-    const totalMinutes = timeDiffSec / 60;
-    const avgVelocity = token.buys / totalMinutes;
-
-    // Jika ada data recentBuys (buys dalam 30 detik terakhir), gunakan itu
-    // Jika tidak, hitung dari total
-    const recentVelocity = token.recentBuys != null
-        ? (token.recentBuys / 0.5) // per menit dari 30 detik terakhir
-        : avgVelocity;
-
-    // Momentum dianggap mati jika velocity sekarang < 40% dari rata-rata
-    const isDying = recentVelocity < avgVelocity * 0.4 && avgVelocity > 5;
-
-    return { isDying, currentVelocity: avgVelocity, recentVelocity };
+function linearScore(v, lo, hi) {
+    if (!Number.isFinite(v)) return 0;
+    if (v <= lo) return 0;
+    if (v >= hi) return 1;
+    return (v - lo) / (hi - lo);
 }
 
-// ============================================================
-// HARD REJECT — langsung gagal tanpa hitung skor
-// Setiap reject = tidak ada autobuy, tidak peduli skor
-// ============================================================
-function getHardRejects(token, timeDiffSec) {
-    const rejects = [];
+function tradeWindows(token) {
+    const tape = Array.isArray(token.tradeTape) ? token.tradeTape : [];
+    const now  = Date.now();
+    const win = [15_000, 45_000, 90_000];
 
-    // 1. Dev sudah jual — sinyal rug terkuat
-    if (token.isDevSold)
-        rejects.push('DEV_SOLD');
-
-    // 2. Sell ratio > 35% (diturunkan dari 40%)
-    const totalTx = token.buys + token.sells;
-    if (totalTx >= 8 && token.sells / totalTx > 0.35)
-        rejects.push('HIGH_SELL_RATIO');
-
-    // 3. Lebih banyak sell daripada buy secara absolut
-    if (totalTx >= 12 && token.sells > token.buys)
-        rejects.push('SELL_DOMINATES');
-
-    // 4. Whale cluster mencurigakan (dihapus batas 30 detik — berlaku seumur token)
-    if (token.whales > 5)
-        rejects.push('SUSPICIOUS_WHALE_CLUSTER');
-
-    // 5. Volume besar tapi buyer sedikit (threshold diturunkan)
-    if (token.volumeSol > 15 && token.buyers.size < 10)
-        rejects.push('LOW_UNIQUE_BUYERS');
-
-    // 6. Bundled launch — manipulasi jelas
-    if (token.isBundled)
-        rejects.push('BUNDLED_LAUNCH');
-
-    // 7. Momentum sedang mati saat kita baru dapat alertnya
-    //    (token sudah tua tapi velocity turun drastis)
-    const decay = calcVelocityDecay(token, timeDiffSec);
-    if (decay.isDying)
-        rejects.push('VELOCITY_DYING');
-
-    // 8. Token terlalu tua (> 10 menit) tanpa graduation — kemungkinan sudah dead
-    if (timeDiffSec > 600 && token.buyers.size < 30)
-        rejects.push('STALE_SLOW_TOKEN');
-
-    return rejects;
-}
-
-// ============================================================
-// SCORING BREAKDOWN — Total maks 100
-// ============================================================
-function calcScore(token, timeDiffSec) {
-    let score = 0;
-    const breakdown = {};
-
-    const totalMinutes = Math.max(timeDiffSec / 60, 0.1);
-
-    // --- 1. BUYER DIVERSITY (30 pts) --- NAIK dari 20
-    // Ini sinyal paling kuat: banyak wallet unik = organik
-    const buyers = token.buyers.size;
-    if (buyers >= 60)      { score += 30; breakdown.buyers = 30; }
-    else if (buyers >= 40) { score += 24; breakdown.buyers = 24; }
-    else if (buyers >= 25) { score += 17; breakdown.buyers = 17; }
-    else if (buyers >= 15) { score += 10; breakdown.buyers = 10; }
-    else if (buyers >= 10) { score += 5;  breakdown.buyers = 5;  }
-    else                   { score += 0;  breakdown.buyers = 0;  }
-
-    // --- 2. VOLUME QUALITY (20 pts) ---
-    // Volume per buyer = ukuran komitmen rata-rata (SOL per wallet)
-    const volPerBuyer = buyers > 0 ? token.volumeSol / buyers : 0;
-    if (volPerBuyer >= 0.4)       { score += 20; breakdown.volume = 20; }
-    else if (volPerBuyer >= 0.2)  { score += 15; breakdown.volume = 15; }
-    else if (volPerBuyer >= 0.10) { score += 9;  breakdown.volume = 9;  }
-    else if (volPerBuyer >= 0.05) { score += 4;  breakdown.volume = 4;  }
-    else                          { score += 0;  breakdown.volume = 0;  }
-
-    // --- 3. MOMENTUM (20 pts) --- TURUN dari 25
-    // Velocity sekarang lebih penting dari rata-rata
-    const velocity = token.buys / totalMinutes;
-    if (velocity >= 40)      { score += 20; breakdown.momentum = 20; }
-    else if (velocity >= 25) { score += 15; breakdown.momentum = 15; }
-    else if (velocity >= 15) { score += 10; breakdown.momentum = 10; }
-    else if (velocity >= 8)  { score += 5;  breakdown.momentum = 5;  }
-    else                     { score += 0;  breakdown.momentum = 0;  }
-
-    // --- 4. WHALE QUALITY (15 pts) ---
-    // Whale ada TAPI tidak terlalu dominan (antara 1-3 whale = bagus)
-    // > 3 whale sudah kena reject, jadi di sini range 1-3
-    if (token.whales >= 2 && token.maxWhaleBuy >= 2 && token.maxWhaleBuy <= 10) {
-        score += 15; breakdown.whale = 15;
-    } else if (token.whales >= 1 && token.maxWhaleBuy >= 1) {
-        score += 8; breakdown.whale = 8;
-    } else {
-        score += 0; breakdown.whale = 0;
-    }
-
-    // --- 5. BUY/SELL RATIO (10 pts) ---
-    const totalTx = token.buys + token.sells;
-    const buyRatio = totalTx > 0 ? token.buys / totalTx : 1;
-    if (buyRatio >= 0.90)      { score += 10; breakdown.bsRatio = 10; }
-    else if (buyRatio >= 0.80) { score += 7;  breakdown.bsRatio = 7;  }
-    else if (buyRatio >= 0.70) { score += 4;  breakdown.bsRatio = 4;  }
-    else                       { score += 0;  breakdown.bsRatio = 0;  }
-
-    // --- 6. SPEED (5 pts) --- TURUN dari 10
-    // Kurang penting: token cepat seringkali sudah ditinggal bot lain
-    if (timeDiffSec <= 45)       { score += 5; breakdown.speed = 5; }
-    else if (timeDiffSec <= 90)  { score += 3; breakdown.speed = 3; }
-    else if (timeDiffSec <= 180) { score += 1; breakdown.speed = 1; }
-    else                         { score += 0; breakdown.speed = 0; }
-
-    // --- BONUS: ORGANIC_GROWTH (+5 bonus, maks total 100) ---
-    // Semua sinyal bagus sekaligus → bonus kepercayaan
-    if (buyers >= 30 && volPerBuyer >= 0.15 && velocity >= 15 && buyRatio >= 0.80) {
-        score += 5;
-        breakdown.organicBonus = 5;
-    }
+    const agg = w => {
+        const minTs = now - w;
+        let buys = 0;
+        let sells = 0;
+        let buySol = 0;
+        let sellSol = 0;
+        for (const t of tape) {
+            if (!t || t.ts < minTs) continue;
+            if (t.type === 'buy') {
+                buys++;
+                buySol += Number(t.sol || 0);
+            } else if (t.type === 'sell') {
+                sells++;
+                sellSol += Number(t.sol || 0);
+            }
+        }
+        return { buys, sells, buySol, sellSol };
+    };
 
     return {
-        total: Math.max(0, Math.min(100, score)),
-        breakdown,
-        velocity: velocity.toFixed(1),
+        w15: agg(win[0]),
+        w45: agg(win[1]),
+        w90: agg(win[2]),
     };
 }
 
-// ============================================================
-// MAIN EVALUATE FUNCTION
-// Returns: { shouldBuy, score, rejects, breakdown, velocity, minScore }
-// ============================================================
+function walletConcentration(token) {
+    const m = token.buySolByWallet;
+    if (!(m instanceof Map) || m.size === 0) return { top1Pct: 0, top3Pct: 0 };
+
+    const vals = [...m.values()].filter(v => Number.isFinite(v) && v > 0).sort((a, b) => b - a);
+    if (vals.length === 0) return { top1Pct: 0, top3Pct: 0 };
+
+    const total = vals.reduce((a, b) => a + b, 0);
+    if (!(total > 0)) return { top1Pct: 0, top3Pct: 0 };
+
+    const top1 = vals[0] / total;
+    const top3 = vals.slice(0, 3).reduce((a, b) => a + b, 0) / total;
+    return { top1Pct: top1, top3Pct: top3 };
+}
+
+function minScoreToBuy() {
+    const floors = { trojan_like: 84, axiom_like: 86, balanced: 80 };
+    const floor = floors[CONFIG.SCORER_PROFILE] || floors.balanced;
+    const n = CONFIG.SIGNAL_MIN_SCORE;
+    const requested = Number.isFinite(n) ? n : floor;
+    const effective = CONFIG.ENFORCE_PROFILE_MIN_SCORE_FLOOR
+        ? Math.max(floor, requested)
+        : requested;
+    return Math.max(0, Math.min(effective, 100));
+}
+
+function calcVelocityStats(token, timeDiffSec) {
+    const avgVelocity = token.buys / Math.max(timeDiffSec / 60, 0.2);
+    const recentVelocity = (Number(token.recentBuys) || 0) / 0.5; // buys/min in last 30s
+    const decayRatio = avgVelocity > 0 ? (recentVelocity / avgVelocity) : 1;
+    return { avgVelocity, recentVelocity, decayRatio };
+}
+
+function getHardRejects(token, timeDiffSec, win, conc) {
+    const rejects = [];
+    const totalTx = token.buys + token.sells;
+    const sellRatio = totalTx > 0 ? token.sells / totalTx : 0;
+    const buyRatio45 = (win.w45.buys + win.w45.sells) > 0
+        ? win.w45.buys / (win.w45.buys + win.w45.sells)
+        : 1;
+    const buyPressure45 = win.w45.buySol - win.w45.sellSol;
+    const { decayRatio } = calcVelocityStats(token, timeDiffSec);
+
+    // Entry timing: terlalu cepat sering noisy, terlalu lama sering sudah fade.
+    if (timeDiffSec < 8) rejects.push('ENTRY_TOO_EARLY');
+    if (timeDiffSec > 240) rejects.push('ENTRY_TOO_LATE');
+
+    if (token.isDevSold) rejects.push('DEV_SOLD');
+    if (token.isBundled) rejects.push('BUNDLED_LAUNCH');
+    if (totalTx >= 10 && sellRatio > 0.38) rejects.push('HIGH_SELL_RATIO');
+    if (win.w45.sells >= 6 && buyRatio45 < 0.58) rejects.push('SELL_PRESSURE_45S');
+    if (timeDiffSec >= 45 && buyPressure45 <= 0) rejects.push('NEGATIVE_NET_FLOW');
+    if (token.whales > 6) rejects.push('SUSPICIOUS_WHALE_CLUSTER');
+    if (conc.top1Pct > 0.45 || conc.top3Pct > 0.78) rejects.push('WALLET_CONCENTRATED');
+    if (token.volumeSol > 15 && token.buyers.size < 12) rejects.push('LOW_UNIQUE_BUYERS');
+    if (timeDiffSec >= 60 && decayRatio < 0.5) rejects.push('VELOCITY_DYING');
+
+    return Array.from(new Set(rejects));
+}
+
 function evaluate(token) {
     const timeDiffSec = Math.max((Date.now() - token.startTime) / 1000, 1);
+    const totalTx = token.buys + token.sells;
+    const buyers = token.buyers.size;
+    const volPerBuyer = buyers > 0 ? token.volumeSol / buyers : 0;
+    const windows = tradeWindows(token);
+    const conc = walletConcentration(token);
+    const vel = calcVelocityStats(token, timeDiffSec);
 
-    const rejects   = getHardRejects(token, timeDiffSec);
-    const { total, breakdown, velocity } = calcScore(token, timeDiffSec);
+    const buyRatio = totalTx > 0 ? token.buys / totalTx : 1;
+    const buyRatio45 = (windows.w45.buys + windows.w45.sells) > 0
+        ? windows.w45.buys / (windows.w45.buys + windows.w45.sells)
+        : 1;
+    const pressure45 = windows.w45.buySol - windows.w45.sellSol;
 
-    const minS      = minScoreToBuy();
+    const rejects = getHardRejects(token, timeDiffSec, windows, conc);
+
+    const weightsByProfile = {
+        trojan_like: {
+            pressure: 0.24, buyRatio: 0.11, velocity: 0.18, decay: 0.09,
+            buyers: 0.11, vol: 0.08, whale: 0.06, conc: 0.07, timing: 0.06,
+        },
+        axiom_like: {
+            pressure: 0.18, buyRatio: 0.14, velocity: 0.12, decay: 0.13,
+            buyers: 0.16, vol: 0.11, whale: 0.08, conc: 0.06, timing: 0.02,
+        },
+        balanced: {
+            pressure: 0.22, buyRatio: 0.12, velocity: 0.16, decay: 0.10,
+            buyers: 0.13, vol: 0.10, whale: 0.07, conc: 0.06, timing: 0.04,
+        },
+    };
+    const w = weightsByProfile[CONFIG.SCORER_PROFILE] || weightsByProfile.balanced;
+
+    const sPressure = linearScore(pressure45, 0.5, 9.0);
+    const sBuyRatio = linearScore(buyRatio45, 0.58, 0.92);
+    const sVelocity = linearScore(vel.recentVelocity, 8, 45);
+    const sDecay    = linearScore(vel.decayRatio, 0.6, 1.6);
+    const sBuyers   = linearScore(buyers, 8, 55);
+    const sVolQual  = linearScore(volPerBuyer, 0.05, 0.5);
+    const sWhaleBal = 1 - linearScore(token.whales, 4, 9); // too many whales = worse
+    const sConc     = 1 - linearScore(conc.top3Pct, 0.62, 0.86);
+    const sTiming   = 1 - Math.abs(clamp((timeDiffSec - 45) / 90, -1, 1)); // best around early trend phase
+
+    const weighted =
+        (sPressure * w.pressure) +
+        (sBuyRatio * w.buyRatio) +
+        (sVelocity * w.velocity) +
+        (sDecay * w.decay) +
+        (sBuyers * w.buyers) +
+        (sVolQual * w.vol) +
+        (sWhaleBal * w.whale) +
+        (sConc * w.conc) +
+        (sTiming * w.timing);
+
+    const bonus =
+        (buyRatio >= 0.8 && buyers >= 20 && vel.decayRatio >= 0.85 && pressure45 > 1.5)
+            ? 5
+            : 0;
+
+    const total = clamp(Math.round(weighted * 100 + bonus), 0, 100);
+    const minS = minScoreToBuy();
     const shouldBuy = rejects.length === 0 && total >= minS;
+
+    // Risk regime exported to execution layer for adaptive stop-loss sizing.
+    let riskLevel = 'medium';
+    if (total >= 90 && rejects.length === 0 && vel.decayRatio >= 0.9 && buyRatio45 >= 0.75) riskLevel = 'low';
+    else if (total < 85 || vel.decayRatio < 0.75 || conc.top1Pct > 0.35) riskLevel = 'high';
+
+    const recommendedSlPct = riskLevel === 'low' ? 7.5 : riskLevel === 'high' ? 11.5 : 9.5;
+
+    const breakdown = {
+        pressure: Number((sPressure * 100).toFixed(0)),
+        buyRatio45: Number((sBuyRatio * 100).toFixed(0)),
+        velocityNow: Number((sVelocity * 100).toFixed(0)),
+        momentumDecay: Number((sDecay * 100).toFixed(0)),
+        buyers: Number((sBuyers * 100).toFixed(0)),
+        volumeQuality: Number((sVolQual * 100).toFixed(0)),
+        whaleBalance: Number((sWhaleBal * 100).toFixed(0)),
+        walletDistribution: Number((sConc * 100).toFixed(0)),
+        timing: Number((sTiming * 100).toFixed(0)),
+        bonus,
+    };
 
     return {
         shouldBuy,
-        score:    total,
+        score: total,
         rejects,
         breakdown,
-        velocity,
+        velocity: vel.recentVelocity.toFixed(1),
         minScore: minS,
+        riskLevel,
+        recommendedSlPct,
+        profile: CONFIG.SCORER_PROFILE || 'balanced',
     };
 }
 
